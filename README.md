@@ -26,48 +26,51 @@ In survival analysis, competing risks refer to situations where multiple types o
 In the context of HFT, there are several competing risks:
 1. **Favorable Fill**: The limit order is executed and the price remains stable or moves in a favorable direction. This is the ideal outcome.
 2. **Toxic Fill (Adverse Selection)**: The limit order is executed but the price moves in an unfavorable direction. This often occurs when the order is "picked off" by an informed counterparty just before a price crash.
-3. **Price Run-away**: The price moves away from the limit order (e.g., price rises while trying to buy) by a threshold $\delta$ before execution occurs. While the order technically still exists in the book, it has economically ``died'' because the probability of execution has collapsed. We treat this as a terminal competing event.
+3. **Price Run-away**: The price moves away from the limit order (e.g., price rises while trying to buy) by a threshold $\delta$ before execution occurs. While the order technically still exists in the book, it has economically "died" because the probability of execution has collapsed. We treat this as a terminal competing event.
 
 ### Right-Censoring
-If none of the three events occur within a maximum observation window $T_{max}$ (e.g., 10 seconds), the data point is **Right-Censored**. We know the order ``survived'' at least until $T_{max}$, but we do not know its ultimate fate. Although historical data allows us to track a virtual order indefinitely until execution, we impose an artificial censoring horizon. This design choice is driven by these factors:
-1. **Decay of Feature Predictive Power**: The predictive validity of the LOB state at time $t_0$ decays rapidly. An execution occurring at $t_0 + 10\text{s}$ is likely driven by market information arriving at $t_0 + 9\text{s}$, not the initial state at $t_0$. Labeling such distant events as ``Fills'' would introduce significant noise, forcing the model to learn spurious correlations between current LOB shapes and distant future events.
-2. **Economic Realism**: In high-frequency market making, orders are dynamic. If a limit order is not executed within a short horizon, the underlying alpha signal is typically considered stale, and the order would be cancelled or repriced in a production environment. Therefore, treating long-duration orders as ``censored'' (outcome unknown/irrelevant) aligns the model with realistic trading constraints.
+If none of the three events occur within a maximum observation window $T_{max}$ (e.g., 10 seconds), the data point is **Right-Censored**. We know the order "survived" at least until $T_{max}$, but we do not know its ultimate fate. Although historical data allows us to track a virtual order indefinitely until execution, we impose an artificial censoring horizon. This design choice is driven by these factors:
+1. **Decay of Feature Predictive Power**: The predictive validity of the LOB state at time $t_0$ decays rapidly. An execution occurring at $t_0 + 10\text{s}$ is likely driven by market information arriving at $t_0 + 9\text{s}$, not the initial state at $t_0$. Labeling such distant events as "Fills" would introduce significant noise, forcing the model to learn spurious correlations between current LOB shapes and distant future events.
+2. **Economic Realism**: In high-frequency market making, orders are dynamic. If a limit order is not executed within a short horizon, the underlying alpha signal is typically considered stale, and the order would be cancelled or repriced in a production environment. Therefore, treating long-duration orders as "censored" (outcome unknown/irrelevant) aligns the model with realistic trading constraints.
 
 ---
 ## Literature Review
 ### Overview of LOB Fill Prediction
-The problem of estimating the probability and timing of limit order execution has evolved from parametric Poisson process models to complex deep learning architectures. Below is a summary of key papers in this area:
+The estimation of limit order execution has evolved from parametric models to deep learning. Key papers include:
 1.  **[A Deep Learning Approach to Estimating Fill Probabilities in a Limit Order Book](references\papers\Maglaras2022.pdf)** (Maglaras et al., 2022)
-    *   **Contribution:** This study represents a foundational shift from classical econometric models to data-driven deep learning. Maglaras et al. utilize Convolutional Neural Networks (CNNs) to extract features from the LOB shape, treating fill probability as a binary classification problem over fixed time horizons.
-    *   **Limitation:** The model utilizes a static binary target (Fill vs. No-Fill), ignoring the continuous temporal nature of execution. It fails to distinguish between *when* an order fills (e.g., 10ms vs. 10s), which is critical for high-frequency strategies.
+    *   **Contribution:** Shifts from econometric models to CNNs, treating fill probability as a binary classification problem over fixed horizons.
+    *   **Limitation:** Uses a static binary target (Fill vs. No-Fill), ignoring the continuous temporal nature of execution critical for high-frequency strategies.
 
 2.  **[Deep Attentive Survival Analysis in Limit Order Books: Estimating Fill Probabilities with Convolutional-Transformers](references\papers\Arroyo2024.pdf)** (Arroyo et al., 2024)
-    *   **Contribution:** Arroyo et al. advance the field by framing execution as a **Survival Analysis** problem rather than classification. They introduce a hybrid architecture combining CNNs for spatial feature extraction and Transformers for temporal dependencies. Their work demonstrates that survival loss functions (like Cox Partial Likelihood) outperform standard cross-entropy loss for execution tasks.
-    *   **Limitation:** While this paper addresses "Time-to-Fill," it treats all fills as homogeneous events. It does not account for **Adverse Selection**—the risk that a fill is immediately followed by a negative price excursion (toxic flow).
+    *   **Contribution:** Frames execution as a **Survival Analysis** problem. Uses a hybrid CNN-Transformer architecture to model time-dependencies better than standard classification.
+    *   **Limitation:** Treats all fills as homogeneous events, failing to account for **Adverse Selection** (toxic flow).
 
 3.  **[Attention-Based Reading, Highlighting, and Forecasting of the Limit Order Book](references\papers\Jung2025.pdf)** (Jung & Lee, 2025)
-    *   **Contribution:** This paper focuses on **Explainable AI (XAI)** within market microstructure. Jung & Lee propose a pure Attention mechanism to "highlight" specific orders and price levels in the LOB that drive future price movements. Their work validates the use of Attention weights to interpret black-box financial models.
-    *   **Limitation:** The primary focus is on forecasting mid-price direction (alpha) rather than the specific mechanics of limit order execution (implementation). It lacks the specific modeling of queue dynamics required for execution algorithms.
+    *   **Contribution:** Focuses on **Explainable AI (XAI)** using Attention mechanisms to "highlight" LOB orders driving price movements.
+    *   **Limitation:** Primarily forecasts mid-price direction (alpha) rather than the specific queue dynamics required for execution algorithms.
+
+### Adverse Selection in LOBs
+Adverse selection occurs when a limit order executes against an informed counterparty, resulting in an immediate mark-to-market loss.
+
+**Limitations of Current Approaches:**
+Existing strategies fail to mitigate this risk due to:
+1.  **Homogenous Success Definitions:** Models treat toxic fills as positive events, learning strategies that seek toxic liquidity.
+2.  **Rigid Theoretical Assumptions:** Traditional Stochastic Optimal Control (SOC) models rely on static penalty parameters that cannot capture real-time signals preceding a pick-off to handle adverse selection. See [Lalor et al. (2025)](references\papers\Lalor2025.pdf).
+
+**How Deep Learning Can Help:**
+Deep learning approximates high-dimensional, non-linear market dynamics without reduced-form assumptions. [Roch (2023)](references\papers\Roch2023.pdf) demonstrates that neural networks utilizing the full LOB depth significantly outperform models relying on best-price data. Similarly, [Zhang et al. (2019)](references\papers\Zhang2019.pdf) show that CNNs can capture spatial patterns predictive of price movements, which can be adapted to identify toxic flow.
 
 ### Our Innovation
-While the existing literature has successfully applied Deep Learning to LOB data, a critical gap remains in the **joint modeling of execution timing and execution quality**.
-
-Our project introduces the specific innovations below:
+We address the critical gap in the **joint modeling of execution timing and execution quality** through three innovations:
 
 #### 1. Methodological: From Binary Classification to Competing Risks
-Most prior works, including Maglaras et al. (2022), treat limit order execution as a binary outcome (Fill vs. No-Fill). This conflates two economically opposing scenarios:
-*   **Scenario A:** The trader captures the spread (profit).
-*   **Scenario B:** The trader is "picked off" by an informed counterparty just before a price crash (loss).
+We reject the homogeneity of "Fills." By adopting a **Deep Competing Risks** framework, we explicitly model the joint distribution of **Time-to-Fill** and **Post-Fill Price Stability**. Unlike Maglaras et al. (2022), this distinguishes between *Liquidity Capture* (profit) and *Adverse Selection* (loss).
 
-We reject the homogeneity of "Fills." By adopting a **Deep Competing Risks** framework, we explicitly model the joint distribution of **Time-to-Fill** and **Post-Fill Price Stability**. This allows our model to distinguish between *Liquidity Capture* (Favorable Fill) and *Adverse Selection* (Toxic Fill), effectively transforming the model from a simple execution predictor into a risk-aware execution strategist.
-
-#### 2. Architectural: Transformer-Enhanced Feature Extraction
-While Arroyo et al. (2024) utilize CNNs, financial time-series data is characterized by "burstiness" and long-range dependencies that Convolutional networks often miss. We replace standard recurrence with a **Transformer Encoder with Multi-Head Self-Attention**.
-*   This architecture allows the model to attend to specific historical microstructure events (e.g., a liquidity vacuum occurring 5 seconds prior) that disproportionately impact current survival probabilities.
-*   The attention weights provide a layer of interpretability, allowing us to visualize which market features (e.g., depth imbalance vs. trade flow) drive the model's prediction of toxic flow.
+#### 2. Architectural: Dynamic-DeepHit with Temporal Attention
+We implement the Dynamic-DeepHit architecture, which extends standard survival models to handle **longitudinal data** and **competing risks**. The temporal attention mechanism allows the model to dynamically weigh historical market states, capturing complex temporal dependencies that static models miss.
 
 #### 3. Evaluation: Economic Utility over Statistical Concordance
-A high Concordance Index (C-index) or low Log-Likelihood does not guarantee profitability. A model might be statistically accurate on calm days but fail catastrophically during volatility. We extend the evaluation framework beyond standard survival metrics to include **Implementation Shortfall (IS)** backtesting. By simulating a strategy that switches between Limit and Market orders based on the model's predicted Cumulative Incidence Function (CIF), we demonstrate the tangible economic value of the model in reducing execution costs.
+We extend evaluation beyond statistical metrics to **Implementation Shortfall (IS)** backtesting. By simulating a strategy that switches order types based on the predicted Cumulative Incidence Function (CIF), we demonstrate the model's tangible economic value in reducing execution costs.
 
 ---
 ## Dataset
@@ -94,38 +97,32 @@ For a complete reference and detailed definitions, please consult the [Databento
 
 ---
 ## Feature Engineering
-To extract meaningful signals regarding execution probability and adverse selection risk, we transform the raw LOB updates into a set of stationary, informative features.
-
-We categorize our feature set into three distinct levels: **Static State**, **Dynamic Flow**, and **Execution Context**.
+We transform raw LOB updates into stationary features across three levels: **Static State**, **Dynamic Flow**, and **Execution Context**.
 
 ### 1. Level-I: Basic LOB State (Static)
-These features capture the shape of the book at a specific snapshot $t$. We utilize the top 10 levels of the LOB.
+These features capture the LOB shape at snapshot $t$ using the top 10 levels.
 
-*   **Mid-Price ($P_{mid}$):** The reference price, defined as $\frac{P_{ask}^{(1)} + P_{bid}^{(1)}}{2}$.
-*   **Bid-Ask Spread ($S_t$):** The cost of immediate liquidity, $P_{ask}^{(1)} - P_{bid}^{(1)}$. A widening spread often indicates uncertainty or informed trading.
-*   **Price Differences ($\Delta P$):** The relative distance between price levels. Since absolute prices are non-stationary, we use differences: $P_{ask}^{(i)} - P_{ask}^{(i-1)}$.
-*   **Depth Imbalance ($\rho_t$):** A strong predictor of short-term price direction. It measures the pressure on the bid vs. ask side:
+*   **Mid-Price ($P_{mid}$):** The reference price, $\frac{P_{ask}^{(1)} + P_{bid}^{(1)}}{2}$.
+*   **Bid-Ask Spread ($S_t$):** The cost of immediate liquidity, $P_{ask}^{(1)} - P_{bid}^{(1)}$. Widening indicates uncertainty.
+*   **Price Differences ($\Delta P$):** Relative distances between levels ($P_{ask}^{(i)} - P_{ask}^{(i-1)}$) to ensure stationarity.
+*   **Depth Imbalance ($\rho_t$):** Measures pressure on the bid vs. ask side.
     $\rho_t = \frac{\sum_{i=1}^{k} V_{bid}^{(i)} - \sum_{i=1}^{k} V_{ask}^{(i)}}{\sum_{i=1}^{k} V_{bid}^{(i)} + \sum_{i=1}^{k} V_{ask}^{(i)}}$
-    *   *Intuition:* If $\rho_t > 0$, buy pressure is high. For a buy limit order, this increases the risk of **Price Run-away** (price moving up away from the order).
+    *   *Intuition:* High buy pressure ($\rho_t > 0$) increases the risk of **Price Run-away** for buy limit orders.
 
 ### 2. Level-II: Dynamic Flow (Kinematic)
-Static features ignore the *rate of change*. We incorporate flow features to capture the "velocity" of the market, which is critical for predicting **Toxic Fills**.
+We incorporate flow features to capture market "velocity," which is critical for predicting **Toxic Fills**.
 
-*   **Order Flow Imbalance (OFI):** Based on the work of Cont et al., OFI measures the net flow of limit orders at the best touch. It captures the intent of market participants (e.g., cancellations on the bid side vs. new additions on the ask side).
-*   **Trade Flow Imbalance (TFI):** The net volume of market orders hitting the bid vs. lifting the ask over a rolling window $\Delta t$.
-    *   *Intuition:* A surge in aggressive sell orders (negative TFI) while our buy limit order is active significantly increases the probability of **Adverse Selection**.
-*   **Realized Volatility ($\sigma_t$):** Calculated as the standard deviation of mid-price returns over the past $n$ ticks. High volatility increases the probability of execution (both favorable and toxic) but reduces the probability of the order resting peacefully.
+*   **Order Flow Imbalance (OFI):** Measures the net flow of limit orders at the best touch, capturing participant intent (e.g., cancellations vs. additions).
+*   **Trade Flow Imbalance (TFI):** The net volume of market orders hitting the bid vs. lifting the ask over window $\Delta t$.
+    *   *Intuition:* A surge in aggressive counter-orders significantly increases **Adverse Selection** risk.
+*   **Realized Volatility ($\sigma_t$):** Standard deviation of mid-price returns. High volatility increases execution probability but reduces resting stability.
 
 ### 3. Level-III: Execution Context (Conditional)
-Unlike standard forecasting models, our Survival framework requires features specific to the *agent's* order, not just the market.
+Unlike standard forecasting, our Survival framework requires features specific to the *agent's* order.
 
 *   **Simulated Queue Position ($Q_{pos}$):**
-    Because exchanges operate on a Price-Time Priority (FIFO) basis, the probability of a fill depends heavily on where the order sits in the queue.
-    *   We simulate $Q_{pos}$ as a normalized value $[0, 1]$.
-    *   $Q_{pos} = 0$: Front of the queue (next to be filled).
-    *   $Q_{pos} = 1$: Back of the queue (last to be filled).
-    *   *Significance:* An order at the back of the queue is protected from "noise" fills but highly exposed to **Adverse Selection** (only getting filled when the entire level is wiped out by a large informed trade).
-
+    Under Price-Time Priority (FIFO), execution depends on queue placement. We simulate this as a normalized value $[0, 1]$.
+    *   *Significance:* An order at the back of the queue ($Q_{pos} \approx 1$) is protected from noise but highly exposed to **Adverse Selection** (getting filled only when the level is wiped out).
 ### 4. Data Preprocessing & Normalization
 *   **Z-Score Normalization:** Applied to Volume, Spread, and Volatility features to center the mean at 0 and variance at 1.
 *   **Log-Transformation:** Applied to raw Volume levels before normalization, as volume data typically follows a power-law distribution.
