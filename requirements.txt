@@ -1,0 +1,3 @@
+databento==0.70.0
+python-dotenv==1.2.1
+sortedcontainers==2.4.0

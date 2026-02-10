@@ -240,3 +240,17 @@ We evaluate model performance using both statistical survival metrics and econom
 ### 2. Economic Utility Metrics
 *   **Implementation Shortfall (IS):** We simulate a trading strategy that uses the model's CIF predictions to decide between placing a limit order or switching to a market order. The IS is calculated as the difference between the execution price and the benchmark price, averaged over all trades.
 *   **Cost Reduction Percentage:** The percentage reduction in execution costs compared to a naive strategy (e.g., always using market orders).
+
+---
+## Setup
+Create a conda environment and install the required packages:
+```bash
+conda create -n lob python=3.13 -y
+conda activate lob
+pip install -r requirements.txt
+```
+
+Create a .env file in the root of the project and add your Databento API key:
+```env
+DATABENTO_API_KEY=<your_api_key_here>
+```
