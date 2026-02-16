@@ -86,14 +86,12 @@ class RepresentationTransform(BaseLOBTransform):
         self, book: Book
     ) -> tuple[Dict[int, float], Dict[int, float]]:
         """Extract bid and ask price->size maps from a Book object."""
-        bids = {int(px): float(level.level.size) for px, level in book.bids.items()}
-        asks = {int(px): float(level.level.size) for px, level in book.offers.items()}
+        bids = {px: level.level.size for px, level in book.bids.items()}
+        asks = {px: level.level.size for px, level in book.offers.items()}
         return bids, asks
 
     def _anchor_mid(self, mid: float) -> int:
         """Snap the mid-price to the tick grid to define the center."""
-        if self.tick_size <= 0:
-            return int(round(mid))
         return int(round(mid / self.tick_size) * self.tick_size)
 
     def _moving_window(
