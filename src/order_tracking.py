@@ -22,7 +22,7 @@ import random
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from lob_implementation import Market, Book
+from .lob_implementation import Market, Book
 
 
 @dataclass
