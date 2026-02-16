@@ -22,7 +22,6 @@ class FeatureConfig:
     window: int = 20
     tick_size: int = 0.01 * DataConfig.price_unit
     representation: str = "market_depth"  # "moving_window" or "market_depth"
-    size_scale: str = "log1p"  # "log1p" or "None"
 
 
 @dataclass(frozen=True)
