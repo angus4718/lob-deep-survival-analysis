@@ -4,10 +4,12 @@ from types import SimpleNamespace
 from pathlib import Path
 import pyarrow.parquet as pq
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+# Ensure project root is in sys.path for src imports
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from order_tracking import OrderTracker, VirtualOrder
+from src.order_tracking import OrderTracker, VirtualOrder
 
 
 class DummyLevel:
