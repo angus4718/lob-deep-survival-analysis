@@ -16,7 +16,7 @@ The main classes are:
 import pandas as pd
 import databento as db
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, Any
 import random
 
 import pyarrow as pa
@@ -24,6 +24,10 @@ import pyarrow.parquet as pq
 
 from .lob_implementation import Market, Book
 from .config import CONFIG
+from .labeling.base import BaseLabeler
+from .labeling.competing_risks import ExecutionCompetingRisksLabeler
+from .features.base import BaseLOBTransform
+from .features.representation import RepresentationTransform
 
 
 @dataclass
@@ -117,14 +121,19 @@ class TrackedOrder:
             "volume": vol,
             "order_type": self.order_type,
         }
-        
+
         # Add BBO context for VirtualOrder
         if isinstance(self, VirtualOrder):
             base["best_bid_at_entry"] = getattr(self, "best_bid_at_entry", None)
             base["best_ask_at_entry"] = getattr(self, "best_ask_at_entry", None)
-            base["best_bid_at_post_trade"] = getattr(self, "best_bid_at_post_trade", None)
-            base["best_ask_at_post_trade"] = getattr(self, "best_ask_at_post_trade", None)
-        
+            base["best_bid_at_post_trade"] = getattr(
+                self, "best_bid_at_post_trade", None
+            )
+            base["best_ask_at_post_trade"] = getattr(
+                self, "best_ask_at_post_trade", None
+            )
+            base["entry_representation"] = getattr(self, "entry_representation", None)
+
         return base
 
 
@@ -144,6 +153,7 @@ class VirtualOrder(TrackedOrder):
     best_ask_at_entry: int = None
     best_bid_at_post_trade: int = None
     best_ask_at_post_trade: int = None
+    entry_representation: Optional[List[float]] = None
 
     def __post_init__(self):
         self.order_type = "VIRTUAL"
@@ -221,7 +231,14 @@ class OrderTracker:
         samples_per_day: Target number of samples per trading day.
     """
 
-    def __init__(self, samples_per_day: int = 100, time_censor_s: float = 300.0):
+    def __init__(
+        self,
+        samples_per_day: int = 100,
+        time_censor_s: float = 300.0,
+        labeler: Optional[BaseLabeler] = None,
+        representation_transform: Optional[BaseLOBTransform] = None,
+        include_representation: bool = True,
+    ):
         self.market = Market()
         self.active_virtual: List[VirtualOrder] = []
         self.post_trade_virtual: List[VirtualOrder] = []
@@ -238,7 +255,47 @@ class OrderTracker:
         self.virtual_sample_index: Dict[int, int] = {}
         self.pending_virtual: Dict[int, List[int]] = {}
 
+        self.labeler = labeler or ExecutionCompetingRisksLabeler()
+        self.representation_transform = (
+            representation_transform or RepresentationTransform()
+        )
+        self.include_representation = include_representation
+
         self.inst = Instrumentation()
+
+    def _apply_labeling(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply configured labeler to a completed order record."""
+        if self.labeler is None:
+            return record
+        try:
+            result = self.labeler.label(record)
+        except Exception:
+            return record
+
+        event_type = result.get("event_type")
+        if event_type is not None:
+            try:
+                record["event_type"] = int(event_type)
+            except Exception:
+                record["event_type"] = event_type
+        record["event_time_bin"] = result.get("event_time_bin")
+
+        extras = result.get("extras", {}) or {}
+        if isinstance(extras, dict):
+            record.update(extras)
+        return record
+
+    def _append_completed_order(
+        self, out_buffer, parquet_writer, output_parquet, parquet_batch_size, order
+    ):
+        """Serialize, label, append, and maybe flush one completed order."""
+        record = order.to_dict()
+        record = self._apply_labeling(record)
+        out_buffer.append(record)
+        out_buffer, parquet_writer = self._maybe_flush(
+            out_buffer, parquet_writer, output_parquet, parquet_batch_size
+        )
+        return out_buffer, parquet_writer
 
     def _maybe_flush(
         self, out_buffer, parquet_writer, output_parquet, parquet_batch_size
@@ -310,12 +367,16 @@ class OrderTracker:
             elif v.status == "FILLED":
                 self.post_trade_virtual.append(v)
             else:
-                out_buffer.append(v.to_dict())
-                out_buffer, parquet_writer = self._maybe_flush(
-                    out_buffer, parquet_writer, output_parquet, parquet_batch_size
+                out_buffer, parquet_writer = self._append_completed_order(
+                    out_buffer,
+                    parquet_writer,
+                    output_parquet,
+                    parquet_batch_size,
+                    v,
                 )
         self.active_virtual = next_active_virtual
         return out_buffer, parquet_writer
+
     def _update_post_trade_virtual(
         self, mbo, book, out_buffer, parquet_writer, parquet_batch_size, output_parquet
     ):
@@ -325,9 +386,12 @@ class OrderTracker:
             v.post_trade_counter += 1
             if v.post_trade_counter >= v.post_trade_window:
                 v.record_post_trade_context(book)
-                out_buffer.append(v.to_dict())
-                out_buffer, parquet_writer = self._maybe_flush(
-                    out_buffer, parquet_writer, output_parquet, parquet_batch_size
+                out_buffer, parquet_writer = self._append_completed_order(
+                    out_buffer,
+                    parquet_writer,
+                    output_parquet,
+                    parquet_batch_size,
+                    v,
                 )
             else:
                 next_post_trade_virtual.append(v)
@@ -345,6 +409,17 @@ class OrderTracker:
         pending_v = self.pending_virtual.get(day, [])
         while pending_v:
             scheduled_ts = pending_v.pop(0)
+            entry_representation = None
+            if (
+                self.include_representation
+                and self.representation_transform is not None
+            ):
+                try:
+                    entry_representation = (
+                        self.representation_transform.transform_snapshot(book).tolist()
+                    )
+                except Exception:
+                    entry_representation = None
 
             bid_level_orders = book.bids.get(best_bid.price)
             if not bid_level_orders:
@@ -375,6 +450,7 @@ class OrderTracker:
                 ids_ahead=ids_ahead,
                 best_bid_at_entry=best_bid.price if best_bid else None,
                 best_ask_at_entry=best_ask.price if best_ask else None,
+                entry_representation=entry_representation,
             )
             self.active_virtual.append(v)
             self.virtual_oid_counter += 1
@@ -409,6 +485,7 @@ class OrderTracker:
                 ids_ahead=ids_ahead,
                 best_bid_at_entry=best_bid.price if best_bid else None,
                 best_ask_at_entry=best_ask.price if best_ask else None,
+                entry_representation=entry_representation,
             )
             self.active_virtual.append(v)
             self.virtual_oid_counter += 1
@@ -424,6 +501,7 @@ class OrderTracker:
         progress_interval: int = 100000,
         progress_callback: Optional[Callable[[int, int, int], None]] = None,
         samples_per_day: int = 100,
+        target_day: Optional[str] = None,
     ):
         """
         Stream MBO messages from `file_path` and write tracked orders.
@@ -437,6 +515,8 @@ class OrderTracker:
             progress_callback: Optional callable invoked as
                 `(count, last_ts, active_virtual)`.
             samples_per_day: Target number of samples per trading day.
+            target_day: Optional local date filter (`YYYY-MM-DD`, New York time).
+                When provided, only messages from this trading day are sampled.
         """
         data = db.DBNStore.from_file(file_path)
         count = 0
@@ -449,6 +529,12 @@ class OrderTracker:
         day_start_ns = None
         day_end_ns = None
         inst = self.inst
+        skipped_apply_errors = 0
+
+        target_day_date = None
+        if target_day is not None:
+            target_day_date = pd.Timestamp(target_day).date()
+        target_day_seen = False
 
         for mbo in data:
             count += 1
@@ -471,8 +557,12 @@ class OrderTracker:
             if limit and count > limit:
                 break
 
-            # Update market state
-            self.market.apply(mbo)
+            # Update market state first to preserve continuity for in-session cancels/modifies.
+            try:
+                self.market.apply(mbo)
+            except (KeyError, AssertionError):
+                skipped_apply_errors += 1
+                continue
 
             msg_day = int(mbo.ts_event // (86400 * 1e9))
             if msg_day != current_day:
@@ -488,6 +578,15 @@ class OrderTracker:
                 day_end_ns = int(day_end_dt.tz_convert("UTC").value)
                 local_date = ts_dt.date()
                 current_day = msg_day
+
+            if target_day_date is not None:
+                if local_date < target_day_date:
+                    continue
+                if local_date > target_day_date:
+                    if target_day_seen:
+                        break
+                    continue
+                target_day_seen = True
 
             if last_ts < day_start_ns or last_ts > day_end_ns:
                 continue
@@ -531,7 +630,24 @@ class OrderTracker:
                 v.on_censor("CENSORED_END")
                 if getattr(v, "end_time", 0) == 0:
                     v.end_time = last_ts
-            out_buffer.append(v.to_dict())
+            out_buffer, parquet_writer = self._append_completed_order(
+                out_buffer,
+                parquet_writer,
+                output_parquet,
+                parquet_batch_size,
+                v,
+            )
+
+        for v in self.post_trade_virtual:
+            if getattr(v, "end_time", 0) == 0:
+                v.end_time = last_ts
+            out_buffer, parquet_writer = self._append_completed_order(
+                out_buffer,
+                parquet_writer,
+                output_parquet,
+                parquet_batch_size,
+                v,
+            )
 
         if out_buffer:
             table = pa.Table.from_pylist(out_buffer)
@@ -546,5 +662,7 @@ class OrderTracker:
             print(
                 f"Sampling summary: scheduled_virtual={inst.scheduled_virtual}, spawned_virtual={inst.spawned_virtual}"
             )
+            if skipped_apply_errors:
+                print(f"Skipped out-of-sequence book updates: {skipped_apply_errors}")
         except Exception:
             pass
