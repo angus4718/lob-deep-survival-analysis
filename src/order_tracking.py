@@ -23,6 +23,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .lob_implementation import Market, Book
+from .config import CONFIG
 
 
 @dataclass
@@ -116,6 +117,14 @@ class TrackedOrder:
             "volume": vol,
             "order_type": self.order_type,
         }
+        
+        # Add BBO context for VirtualOrder
+        if isinstance(self, VirtualOrder):
+            base["best_bid_at_entry"] = getattr(self, "best_bid_at_entry", None)
+            base["best_ask_at_entry"] = getattr(self, "best_ask_at_entry", None)
+            base["best_bid_at_post_trade"] = getattr(self, "best_bid_at_post_trade", None)
+            base["best_ask_at_post_trade"] = getattr(self, "best_ask_at_post_trade", None)
+        
         return base
 
 
@@ -131,6 +140,10 @@ class VirtualOrder(TrackedOrder):
 
     current_vahead: int = 0
     ids_ahead: Dict[int, int] = field(default_factory=dict)
+    best_bid_at_entry: int = None
+    best_ask_at_entry: int = None
+    best_bid_at_post_trade: int = None
+    best_ask_at_post_trade: int = None
 
     def __post_init__(self):
         self.order_type = "VIRTUAL"
@@ -143,14 +156,24 @@ class VirtualOrder(TrackedOrder):
         best_bid_px = b.price if b else None
         best_ask_px = a.price if a else None
 
-        # PRICE RUNAWAY LABELING LOGIC
-        # if PRICE RUNAWAY CONDITION:
-        #     self.on_censor("PRICE_RUNAWAY", mbo)
-        #     return
+        # PRICE RUNAWAY DETECTION
+        if self.side == "B" and best_bid_px is not None:
+            price_move_bps = ((self.price - best_bid_px) / self.price) * 10000
+            if price_move_bps > CONFIG.labeling.price_runaway_bps:
+                self.on_censor("PRICE_RUNAWAY", mbo)
+                return
+        elif self.side == "A" and best_ask_px is not None:
+            price_move_bps = ((best_ask_px - self.price) / self.price) * 10000
+            if price_move_bps > CONFIG.labeling.price_runaway_bps:
+                self.on_censor("PRICE_RUNAWAY", mbo)
+                return
 
         # Fill when no volume is ahead
         if self.current_vahead <= 0:
             self.on_fill(mbo)
+            # Start post-trade context tracking
+            self.post_trade_counter = 0
+            self.post_trade_window = CONFIG.labeling.tox_post_trade_move_window_events
             return
 
         # Adjust volume ahead in response to cancels/fills/modifies
@@ -179,6 +202,11 @@ class VirtualOrder(TrackedOrder):
                     self.current_vahead -= diff
                     self.ids_ahead[mbo.order_id] = mbo.size
 
+    def record_post_trade_context(self, book: Book):
+        b, a = book.bbo()
+        self.best_bid_at_post_trade = b.price if b else None
+        self.best_ask_at_post_trade = a.price if a else None
+
 
 @dataclass
 class OrderTracker:
@@ -196,6 +224,7 @@ class OrderTracker:
     def __init__(self, samples_per_day: int = 100, time_censor_s: float = 300.0):
         self.market = Market()
         self.active_virtual: List[VirtualOrder] = []
+        self.post_trade_virtual: List[VirtualOrder] = []
         self.completed: List[TrackedOrder] = []
 
         self.last_sample_time = 0
@@ -266,8 +295,8 @@ class OrderTracker:
         self, mbo, book, out_buffer, parquet_writer, parquet_batch_size, output_parquet
     ):
         """Update all active virtual orders with the incoming MBO message.
-
-        Orders that finish are appended to `out_buffer` for eventual write.
+        Orders that finish by fill are moved to post_trade_virtual for post-trade context.
+        Others are appened to `out_buffer` immediately for eventual write.
         """
         next_active_virtual = []
         for v in self.active_virtual:
@@ -278,12 +307,31 @@ class OrderTracker:
 
             if v.is_active():
                 next_active_virtual.append(v)
+            elif v.status == "FILLED":
+                self.post_trade_virtual.append(v)
             else:
                 out_buffer.append(v.to_dict())
                 out_buffer, parquet_writer = self._maybe_flush(
                     out_buffer, parquet_writer, output_parquet, parquet_batch_size
                 )
         self.active_virtual = next_active_virtual
+        return out_buffer, parquet_writer
+    def _update_post_trade_virtual(
+        self, mbo, book, out_buffer, parquet_writer, parquet_batch_size, output_parquet
+    ):
+        """Update post-trade virtuals, increment counter, and capture BBO at window end."""
+        next_post_trade_virtual = []
+        for v in self.post_trade_virtual:
+            v.post_trade_counter += 1
+            if v.post_trade_counter >= v.post_trade_window:
+                v.record_post_trade_context(book)
+                out_buffer.append(v.to_dict())
+                out_buffer, parquet_writer = self._maybe_flush(
+                    out_buffer, parquet_writer, output_parquet, parquet_batch_size
+                )
+            else:
+                next_post_trade_virtual.append(v)
+        self.post_trade_virtual = next_post_trade_virtual
         return out_buffer, parquet_writer
 
     def _spawn_virtuals_for_pending(self, day, book, best_bid, best_ask):
@@ -325,6 +373,8 @@ class OrderTracker:
                 side="B",
                 current_vahead=current_vahead,
                 ids_ahead=ids_ahead,
+                best_bid_at_entry=best_bid.price if best_bid else None,
+                best_ask_at_entry=best_ask.price if best_ask else None,
             )
             self.active_virtual.append(v)
             self.virtual_oid_counter += 1
@@ -357,6 +407,8 @@ class OrderTracker:
                 side="A",
                 current_vahead=current_vahead,
                 ids_ahead=ids_ahead,
+                best_bid_at_entry=best_bid.price if best_bid else None,
+                best_ask_at_entry=best_ask.price if best_ask else None,
             )
             self.active_virtual.append(v)
             self.virtual_oid_counter += 1
@@ -455,6 +507,15 @@ class OrderTracker:
             if not best_bid or not best_ask:
                 continue
             out_buffer, parquet_writer = self._update_active_virtual(
+                mbo,
+                book,
+                out_buffer,
+                parquet_writer,
+                parquet_batch_size,
+                output_parquet,
+            )
+
+            out_buffer, parquet_writer = self._update_post_trade_virtual(
                 mbo,
                 book,
                 out_buffer,

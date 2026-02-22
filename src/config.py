@@ -25,9 +25,28 @@ class FeatureConfig:
 
 
 @dataclass(frozen=True)
+class LabelingConfig:
+    price_runaway_bps: float = 1.0  # basis points, e.g., 0.1%
+    tox_bps: float = 0.05  # bps, indicator of unfavorable fill
+    tox_spread_bps: float = 2.0  # use for market condition checks
+    tox_duration_s: float = 60
+    tox_post_trade_move_window_events: int = 100
+    binning_strategy: str = "log"  # "uniform" or "log"
+
+
+@dataclass(frozen=True)
+class TimeBinningConfig:
+    bin_width_s: float = 1.0
+    min_time_s: float = 0.01
+    max_time_s: float = 300
+    n_bins: int = 20
+
+@dataclass(frozen=True)
 class ProjectConfig:
     data: DataConfig = DataConfig()
     features: FeatureConfig = FeatureConfig()
+    labeling: LabelingConfig = LabelingConfig()
+    time_binning: TimeBinningConfig = TimeBinningConfig()
 
 
 CONFIG = ProjectConfig()
