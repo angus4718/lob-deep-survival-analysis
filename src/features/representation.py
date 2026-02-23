@@ -20,7 +20,7 @@ from typing import Dict, Sequence
 import torch
 
 from .base import BaseLOBTransform
-from ..config import FeatureConfig
+from ..config import CONFIG
 from ..lob_implementation import Book
 
 
@@ -28,9 +28,9 @@ from ..lob_implementation import Book
 class RepresentationTransform(BaseLOBTransform):
     """Mid-price centered moving-window or market-depth representation."""
 
-    window: int = FeatureConfig.window
-    tick_size: int = FeatureConfig.tick_size
-    representation: str = FeatureConfig.representation
+    window: int = CONFIG.features.window
+    tick_size: int = CONFIG.features.tick_size
+    representation: str = CONFIG.features.representation
 
     def transform_sequence(self, lob_states: Sequence[Book]) -> torch.Tensor:
         """Convert a sequence of Book objects into a (T, 2W+1) tensor.
@@ -49,6 +49,58 @@ class RepresentationTransform(BaseLOBTransform):
 
         features = [self._transform_with_center(state, center) for state in lob_states]
         return torch.stack(features, dim=0)
+
+    def transform_sequence_from_dicts(
+        self,
+        snapshots: Sequence[tuple],
+        n_lookback: int,
+    ) -> torch.Tensor:
+        """Convert a sequence of (bids_dict, asks_dict) tuples into a (n_lookback, 2W+1) tensor.
+
+        Uses the most recent snapshot's mid-price as the common center for all
+        time steps.  If fewer than ``n_lookback`` snapshots are available the
+        result is zero-padded at the beginning so the output always has shape
+        ``(n_lookback, 2W+1)``.
+
+        Args:
+            snapshots: Sequence of ``(bids, asks)`` dicts where keys are integer
+                prices and values are aggregate sizes at that level.
+            n_lookback: Required number of time steps in the output.
+
+        Returns:
+            Float tensor of shape ``(n_lookback, 2W+1)``.
+        """
+        width = 2 * self.window + 1
+        if not snapshots:
+            return torch.zeros((n_lookback, width), dtype=torch.float32)
+
+        bids_last, asks_last = snapshots[-1]
+        if not bids_last or not asks_last:
+            return torch.zeros((n_lookback, width), dtype=torch.float32)
+
+        best_bid = max(bids_last.keys())
+        best_ask = min(asks_last.keys())
+        mid = 0.5 * (best_bid + best_ask)
+        center = self._anchor_mid(mid)
+
+        features: list[torch.Tensor] = []
+        for bids, asks in snapshots:
+            if self.representation == "moving_window":
+                vals = self._moving_window(bids, asks, center)
+            elif self.representation == "market_depth":
+                vals = self._market_depth(bids, asks, center)
+            else:
+                raise ValueError(f"Unknown representation: {self.representation}")
+            features.append(torch.tensor(vals, dtype=torch.float32))
+
+        tensor = torch.stack(features, dim=0)
+
+        # Pad with zeros at the start when the buffer is not yet full
+        if len(features) < n_lookback:
+            pad = torch.zeros((n_lookback - len(features), width), dtype=torch.float32)
+            tensor = torch.cat([pad, tensor], dim=0)
+
+        return tensor
 
     def transform_snapshot(self, lob_state: Book) -> torch.Tensor:
         """Convert one Book object into a centered (2W+1) vector."""

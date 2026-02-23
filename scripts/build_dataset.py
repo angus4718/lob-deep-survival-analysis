@@ -21,7 +21,7 @@ FILE_NAME = (
 )
 SAMPLES_PER_DAY = 100
 TIME_CENSOR_S = 300.0
-PROGRESS_INTERVAL = 1_000_000
+PROGRESS_INTERVAL = 100_000
 
 dbn_path = Path("data") / "raw" / f"{FILE_NAME}.dbn.zst"
 output_path = Path("data") / "datasets" / f"dataset_{FILE_NAME}.parquet"
@@ -34,6 +34,7 @@ else:
     tracker = OrderTracker(
         samples_per_day=SAMPLES_PER_DAY,
         time_censor_s=TIME_CENSOR_S,
+        lookback_period=20,
     )
 
     tracker.process_stream(

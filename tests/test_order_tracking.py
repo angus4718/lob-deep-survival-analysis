@@ -16,6 +16,10 @@ class DummyLevel:
     def __init__(self, orders):
         self.orders = [SimpleNamespace(order_id=o[0], size=o[1]) for o in orders]
 
+    @property
+    def level(self):
+        return SimpleNamespace(size=sum(getattr(o, "size", 0) for o in self.orders))
+
 
 class DummyBook:
     def __init__(self, bids=None, offers=None):
@@ -116,9 +120,10 @@ def test_update_active_virtual_fill_and_censor():
     out_buffer, parquet_writer = tr._update_active_virtual(
         mbo, DummyBook(), out_buffer, parquet_writer, 10, "out.parquet"
     )
-    # v should be moved to out_buffer and active_virtual empty
-    assert len(out_buffer) == 1
+    # Filled orders now move to post-trade tracking first
+    assert len(out_buffer) == 0
     assert len(tr.active_virtual) == 0
+    assert len(tr.post_trade_virtual) == 1
 
     # now test time censoring: create v2 with entry_time far in past
     v2 = VirtualOrder(
@@ -295,8 +300,9 @@ def test_update_active_virtual_multiple_finishes():
     out_buffer, parquet_writer = tr._update_active_virtual(
         mbo, DummyBook(), out_buffer, parquet_writer, 10, "out.parquet"
     )
-    assert len(out_buffer) == 2
+    assert len(out_buffer) == 0
     assert len(tr.active_virtual) == 0
+    assert len(tr.post_trade_virtual) == 2
 
 
 def test_maybe_flush_multiple_batches_and_readback(tmp_path):
@@ -339,6 +345,31 @@ def test_trackedorder_to_dict_fields():
     assert rec["event"] == 1
     assert abs(rec["duration_s"] - 100 / 1e9) < 1e-12
     assert rec["volume"] == 1
+
+
+def test_spawn_uses_sequence_entry_representation():
+    tr = OrderTracker(samples_per_day=1, representation_context_events=5)
+    day = 12
+    tr.pending_virtual[day] = [999]
+
+    bid_level = DummyLevel(orders=[(11, 5), (12, 3)])
+    ask_level = DummyLevel(orders=[(21, 2), (22, 4)])
+    book = DummyBook(bids={100: bid_level}, offers={101: ask_level})
+    best_bid = SimpleNamespace(price=100, size=8)
+    best_ask = SimpleNamespace(price=101, size=6)
+
+    key = (1, 1)
+    for _ in range(3):
+        tr._update_book_history(key, book)
+
+    tr._spawn_virtuals_for_pending(day, book, best_bid, best_ask, key)
+
+    assert len(tr.active_virtual) >= 2
+    sample_repr = tr.active_virtual[-1].entry_representation
+    assert sample_repr is not None
+    assert isinstance(sample_repr, list)
+    assert len(sample_repr) == 3
+    assert isinstance(sample_repr[0], list)
 
 
 def test_maybe_flush_writes_parquet(tmp_path):

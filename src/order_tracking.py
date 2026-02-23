@@ -13,6 +13,7 @@ The main classes are:
     update logic for queue-depletion and censoring.
 """
 
+import collections
 import pandas as pd
 import databento as db
 from dataclasses import dataclass, field
@@ -122,7 +123,6 @@ class TrackedOrder:
             "order_type": self.order_type,
         }
 
-        # Add BBO context for VirtualOrder
         if isinstance(self, VirtualOrder):
             base["best_bid_at_entry"] = getattr(self, "best_bid_at_entry", None)
             base["best_ask_at_entry"] = getattr(self, "best_ask_at_entry", None)
@@ -153,7 +153,7 @@ class VirtualOrder(TrackedOrder):
     best_ask_at_entry: int = None
     best_bid_at_post_trade: int = None
     best_ask_at_post_trade: int = None
-    entry_representation: Optional[List[float]] = None
+    entry_representation: Optional[List] = None  # (lookback, 2W+1) 2-D list
 
     def __post_init__(self):
         self.order_type = "VIRTUAL"
@@ -238,6 +238,8 @@ class OrderTracker:
         labeler: Optional[BaseLabeler] = None,
         representation_transform: Optional[BaseLOBTransform] = None,
         include_representation: bool = True,
+        lookback_period: int = 10,
+        snapshot_bin_s: Optional[float] = None,
     ):
         self.market = Market()
         self.active_virtual: List[VirtualOrder] = []
@@ -260,6 +262,16 @@ class OrderTracker:
             representation_transform or RepresentationTransform()
         )
         self.include_representation = include_representation
+
+        self.lookback_period = lookback_period
+        _bin_s = (
+            snapshot_bin_s if snapshot_bin_s is not None else CONFIG.features.interval_s
+        )
+        self._snapshot_bin_ns: int = int(_bin_s * 1e9)
+        self._lob_snapshot_buffer: collections.deque = collections.deque(
+            maxlen=lookback_period
+        )
+        self._last_snapshot_ts: int = 0
 
         self.inst = Instrumentation()
 
@@ -415,8 +427,11 @@ class OrderTracker:
                 and self.representation_transform is not None
             ):
                 try:
+                    buf = list(self._lob_snapshot_buffer)
                     entry_representation = (
-                        self.representation_transform.transform_snapshot(book).tolist()
+                        self.representation_transform.transform_sequence_from_dicts(
+                            buf, self.lookback_period
+                        ).tolist()
                     )
                 except Exception:
                     entry_representation = None
@@ -551,9 +566,7 @@ class OrderTracker:
                     except Exception:
                         pass
                 else:
-                    print(
-                        f"Processed {count} messages — last_ts={last_ts}, active_virtual={len(self.active_virtual)}"
-                    )
+                    print(f"Processed {count} messages - last_ts={last_ts}")
             if limit and count > limit:
                 break
 
@@ -597,6 +610,17 @@ class OrderTracker:
 
             self._move_scheduled_virtual_to_pending(day, mbo.ts_event)
 
+            snapshot_due = (
+                mbo.ts_event - self._last_snapshot_ts >= self._snapshot_bin_ns
+            )
+            if (
+                not self.active_virtual
+                and not self.post_trade_virtual
+                and not self.pending_virtual.get(day)
+                and not snapshot_due
+            ):
+                continue
+
             try:
                 book = self.market.get_book(mbo.instrument_id, mbo.publisher_id)
             except KeyError:
@@ -605,6 +629,17 @@ class OrderTracker:
             best_bid, best_ask = book.bbo()
             if not best_bid or not best_ask:
                 continue
+
+            if snapshot_due:
+                bids_snap = {
+                    px: sum(o.size for o in lo.orders) for px, lo in book.bids.items()
+                }
+                asks_snap = {
+                    px: sum(o.size for o in lo.orders) for px, lo in book.offers.items()
+                }
+                self._lob_snapshot_buffer.append((bids_snap, asks_snap))
+                self._last_snapshot_ts = mbo.ts_event
+
             out_buffer, parquet_writer = self._update_active_virtual(
                 mbo,
                 book,

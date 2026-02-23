@@ -41,7 +41,7 @@ def create_book_with_levels(
     return book
 
 
-from src.config import FeatureConfig
+from src.config import CONFIG
 
 
 class TestRepresentationTransform:
@@ -50,9 +50,9 @@ class TestRepresentationTransform:
     def test_init_defaults(self):
         """Test initialization with default config."""
         transform = RepresentationTransform()
-        assert transform.window == FeatureConfig.window
-        assert transform.tick_size == FeatureConfig.tick_size
-        assert transform.representation == FeatureConfig.representation
+        assert transform.window == CONFIG.features.window
+        assert transform.tick_size == CONFIG.features.tick_size
+        assert transform.representation == CONFIG.features.representation
 
     def test_transform_snapshot_basic(self):
         """Test transform_snapshot with a simple book."""
@@ -221,7 +221,7 @@ class TestRepresentationTransform:
     def test_anchor_mid(self):
         """Test mid-price anchoring to tick grid."""
         # Use tick_size in nanodollars (default)
-        default_tick = FeatureConfig.tick_size
+        default_tick = CONFIG.features.tick_size
         transform1 = RepresentationTransform(tick_size=default_tick)
         # 100.5 nanodollars, anchored to tick grid
         # Should round to nearest tick multiple

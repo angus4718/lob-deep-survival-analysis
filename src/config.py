@@ -22,6 +22,7 @@ class FeatureConfig:
     window: int = 20
     tick_size: int = 0.01 * DataConfig.price_unit
     representation: str = "market_depth"  # "moving_window" or "market_depth"
+    interval_s: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ class TimeBinningConfig:
     min_time_s: float = 0.01
     max_time_s: float = 300
     n_bins: int = 20
+
 
 @dataclass(frozen=True)
 class ProjectConfig:

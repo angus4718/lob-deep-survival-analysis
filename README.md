@@ -96,37 +96,11 @@ We obtain NASDAQ ITCH data from  **Databento** Market-by-Order (MBO) schemas. Th
 For a complete reference and detailed definitions, please consult the [Databento MBO Documentation](https://databento.com/docs/schemas-and-data-formats/mbo).
 
 ---
-## Feature Engineering
-We transform raw LOB updates into stationary features across three levels: **Static State**, **Dynamic Flow**, and **Execution Context**.
-
-### 1. Level-I: Basic LOB State (Static)
-These features capture the LOB shape at snapshot $t$ using the top 10 levels.
-
-*   **Mid-Price ($P_{mid}$):** The reference price, $\frac{P_{ask}^{(1)} + P_{bid}^{(1)}}{2}$.
-*   **Bid-Ask Spread ($S_t$):** The cost of immediate liquidity, $P_{ask}^{(1)} - P_{bid}^{(1)}$. Widening indicates uncertainty.
-*   **Price Differences ($\Delta P$):** Relative distances between levels ($P_{ask}^{(i)} - P_{ask}^{(i-1)}$) to ensure stationarity.
-*   **Depth Imbalance ($\rho_t$):** Measures pressure on the bid vs. ask side.
-    $\rho_t = \frac{\sum_{i=1}^{k} V_{bid}^{(i)} - \sum_{i=1}^{k} V_{ask}^{(i)}}{\sum_{i=1}^{k} V_{bid}^{(i)} + \sum_{i=1}^{k} V_{ask}^{(i)}}$
-    *   *Intuition:* High buy pressure ($\rho_t > 0$) increases the risk of **Price Run-away** for buy limit orders.
-
-### 2. Level-II: Dynamic Flow (Kinematic)
-We incorporate flow features to capture market "velocity," which is critical for predicting **Toxic Fills**.
-
-*   **Order Flow Imbalance (OFI):** Measures the net flow of limit orders at the best touch, capturing participant intent (e.g., cancellations vs. additions).
-*   **Trade Flow Imbalance (TFI):** The net volume of market orders hitting the bid vs. lifting the ask over window $\Delta t$.
-    *   *Intuition:* A surge in aggressive counter-orders significantly increases **Adverse Selection** risk.
-*   **Realized Volatility ($\sigma_t$):** Standard deviation of mid-price returns. High volatility increases execution probability but reduces resting stability.
-
-### 3. Level-III: Execution Context (Conditional)
-Unlike standard forecasting, our Survival framework requires features specific to the *agent's* order.
-
-*   **Simulated Queue Position ($Q_{pos}$):**
-    Under Price-Time Priority (FIFO), execution depends on queue placement. We simulate this as a normalized value $[0, 1]$.
-    *   *Significance:* An order at the back of the queue ($Q_{pos} \approx 1$) is protected from noise but highly exposed to **Adverse Selection** (getting filled only when the level is wiped out).
-### 4. Data Preprocessing & Normalization
-*   **Z-Score Normalization:** Applied to Volume, Spread, and Volatility features to center the mean at 0 and variance at 1.
-*   **Log-Transformation:** Applied to raw Volume levels before normalization, as volume data typically follows a power-law distribution.
-*   **Stationarity Checks:** All price inputs are converted to returns or relative differences to ensure stationarity, preventing the model from learning specific price levels (e.g., "Buy at $150") rather than market dynamics.
+## Representation Engineering
+Following the methodology outlined in [Wu et al. (2022)](references\papers\Wu2022.pdf), we construct two types of representations from the raw MBO data:
+1. **Moving-Window Representation:** A fixed-length matrix capturing the LOB state in a specified time window (e.g., 2s) before the order entry. The matrix is centered at the mid-price at order entry and includes the volumes at all nearby price ticks. This representation captures the spatial structure of the LOB and is suitable for CNN-based encoders.
+2. **Order-Depth Representation:** This is similar to the moving-window representation but stores the cumulative volumes at each price level instead of the raw volumes. This representation emphasizes the depth of liquidity at each price level, which can be critical for predicting execution outcomes.
+For more details, please refer to the [demo notebook](notebooks/demo_representations_sampling.ipynb), which illustrates the construction of these representations from the raw MBO data.
 
 ---
 ## Model Architecture: The Dynamic-DeepHit Framework
