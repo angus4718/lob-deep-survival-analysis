@@ -1,7 +1,9 @@
-databento==0.70.0
-pandas==3.0.0
+databento==0.71.0
+numpy==2.4.2
+pandas==3.0.1
 pyarrow==23.0.0
 pytest==9.0.2
 python-dotenv==1.2.1
 sortedcontainers==2.4.0
 torch==2.10.0
+tqdm==4.67.3

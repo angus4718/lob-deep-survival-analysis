@@ -14,6 +14,10 @@ The main classes are:
 """
 
 import collections
+import os
+import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
 import pandas as pd
 import databento as db
 from dataclasses import dataclass, field
@@ -22,13 +26,150 @@ import random
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from tqdm import tqdm
 
 from .lob_implementation import Market, Book
+
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 from .config import CONFIG
 from .labeling.base import BaseLabeler
 from .labeling.competing_risks import ExecutionCompetingRisksLabeler
 from .features.base import BaseLOBTransform
 from .features.representation import RepresentationTransform
+
+
+def _market_is_empty(market: Market) -> bool:
+    """Return True iff every book in the market has no resting orders."""
+    for pub_books in market.books.values():
+        for book in pub_books.values():
+            if book.bids or book.offers or book.orders_by_id:
+                return False
+    return True
+
+
+def find_empty_market_points(file_path: str, verbose: bool = True) -> List[int]:
+    """
+    Scan a DBN file in a single pass and return a sorted list of
+    ``ts_event`` values (nanoseconds) at which the aggregated order book
+    transitions from *non-empty* to completely *empty*.
+
+    These timestamps are safe split-points for parallel processing because
+    each chunk can start with a clean (empty) book state.
+
+    Args:
+        file_path: Path to the DBN or DBN.ZST file.
+        verbose: Print progress dots to stdout.
+
+    Returns:
+        Sorted list of nanosecond timestamps.
+    """
+    data = db.DBNStore.from_file(file_path)
+    market = Market()
+    had_orders = False
+    empty_timestamps: List[int] = []
+    count = 0
+
+    for mbo in data:
+        if not isinstance(mbo, db.MBOMsg):
+            continue
+        count += 1
+        if verbose and count % 1_000_000 == 0:
+            print(
+                f"  [scan] {count:,} messages scanned, "
+                f"{len(empty_timestamps)} split points found so far"
+            )
+        try:
+            market.apply(mbo)
+        except (KeyError, AssertionError):
+            continue
+        is_empty = _market_is_empty(market)
+        if not had_orders and not is_empty:
+            had_orders = True
+        if had_orders and is_empty:
+            empty_timestamps.append(mbo.ts_event)
+            had_orders = False  # reset: next non-empty to empty is a new event
+
+    if verbose:
+        print(
+            f"  [scan] Finished. {count:,} messages, "
+            f"{len(empty_timestamps)} empty-market transitions found."
+        )
+    return empty_timestamps
+
+
+def _select_split_points(empty_points: List[int], n: int) -> List[int]:
+    """
+    Choose ``n - 1`` timestamps from *empty_points* that divide the
+    timeline ``[empty_points[0], empty_points[-1]]`` into *n* roughly
+    equal segments.
+
+    Args:
+        empty_points: Sorted list of empty-market timestamps (ns).
+        n: Desired number of chunks.
+
+    Returns:
+        Sorted list of ``n - 1`` split timestamps (may be fewer if there
+        are not enough distinct empty points).
+    """
+    if n <= 1 or not empty_points:
+        return []
+    lo, hi = empty_points[0], empty_points[-1]
+    if lo == hi:
+        return []
+    targets = [lo + i * (hi - lo) // n for i in range(1, n)]
+    chosen: set = set()
+    for target in targets:
+        best = min(empty_points, key=lambda t: abs(t - target))
+        chosen.add(best)
+    return sorted(chosen)
+
+
+def _chunk_worker(kwargs: dict) -> dict:
+    """
+    Module-level worker function executed by ``ProcessPoolExecutor``.
+
+    Instantiates a fresh :class:`OrderTracker`, processes one time-slice
+    of the DBN file, and writes results to a temporary Parquet file.
+
+    Args:
+        kwargs: Dict produced by :meth:`OrderTracker.process_stream_parallel`.
+
+    Returns:
+        Dict with keys ``output_parquet``, ``scheduled_virtual``,
+        ``spawned_virtual``.
+    """
+    import sys
+
+    project_root = kwargs.pop("_project_root", None)
+    if project_root and project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    # Re-import after path fix (needed in spawned worker processes)
+    from src.order_tracking import OrderTracker
+
+    tracker_kwargs = kwargs.pop("tracker_kwargs")
+    file_path = kwargs.pop("file_path")
+    output_parquet = kwargs.pop("output_parquet")
+    chunk_ts_start: Optional[int] = kwargs.pop("chunk_ts_start", None)
+    chunk_ts_end: Optional[int] = kwargs.pop("chunk_ts_end", None)
+    chunk_idx: int = kwargs.pop("chunk_idx", 0)
+    # Remaining keys forwarded to process_stream
+    process_kwargs = kwargs
+
+    tracker = OrderTracker(**tracker_kwargs)
+    tracker.process_stream(
+        file_path=file_path,
+        output_parquet=output_parquet,
+        chunk_ts_start=chunk_ts_start,
+        chunk_ts_end=chunk_ts_end,
+        **process_kwargs,
+    )
+    return {
+        "chunk_idx": chunk_idx,
+        "output_parquet": output_parquet,
+        "scheduled_virtual": tracker.inst.scheduled_virtual,
+        "spawned_virtual": tracker.inst.spawned_virtual,
+    }
 
 
 @dataclass
@@ -275,6 +416,15 @@ class OrderTracker:
 
         self.inst = Instrumentation()
 
+        # Store primitive constructor args so workers can recreate a tracker
+        self._init_kwargs = dict(
+            samples_per_day=samples_per_day,
+            time_censor_s=time_censor_s,
+            include_representation=include_representation,
+            lookback_period=lookback_period,
+            snapshot_bin_s=_bin_s,
+        )
+
     def _apply_labeling(self, record: Dict[str, Any]) -> Dict[str, Any]:
         """Apply configured labeler to a completed order record."""
         if self.labeler is None:
@@ -517,6 +667,10 @@ class OrderTracker:
         progress_callback: Optional[Callable[[int, int, int], None]] = None,
         samples_per_day: int = 100,
         target_day: Optional[str] = None,
+        chunk_ts_start: Optional[int] = None,
+        chunk_ts_end: Optional[int] = None,
+        tqdm_position: Optional[int] = None,
+        tqdm_desc: Optional[str] = None,
     ):
         """
         Stream MBO messages from `file_path` and write tracked orders.
@@ -525,17 +679,36 @@ class OrderTracker:
             file_path: Path to DBN file to stream.
             output_parquet: Path to output Parquet file to write records.
             limit: Optional message limit to process.
-            progress_interval: Interval (messages) to call the progress
-                callback or print progress.
+            progress_interval: Interval (messages) to update the progress bar.
             progress_callback: Optional callable invoked as
                 `(count, last_ts, active_virtual)`.
             samples_per_day: Target number of samples per trading day.
             target_day: Optional local date filter (`YYYY-MM-DD`, New York time).
                 When provided, only messages from this trading day are sampled.
+            chunk_ts_start: Optional nanosecond timestamp; messages strictly
+                before this value are skipped without affecting book state.
+                Pass an empty-market boundary so book initialises cleanly.
+            chunk_ts_end: Optional nanosecond timestamp; iteration stops when
+                a message at or beyond this value is encountered.
+            tqdm_position: Row position of this bar in the terminal (for
+                simultaneous multi-chunk display).  Pass ``None`` for
+                single-stream use.
+            tqdm_desc: Label shown to the left of the progress bar.
         """
         data = db.DBNStore.from_file(file_path)
         count = 0
         last_ts = 0
+        _desc = tqdm_desc or (
+            f"Chunk {tqdm_position}" if tqdm_position is not None else "Processing"
+        )
+        pbar = tqdm(
+            desc=_desc,
+            unit=" msg",
+            position=tqdm_position,
+            leave=True,
+            dynamic_ncols=True,
+            miniters=progress_interval,
+        )
         parquet_writer = None
         parquet_batch_size = 100000
         out_buffer: List[dict] = []
@@ -555,7 +728,14 @@ class OrderTracker:
             count += 1
             last_ts = mbo.ts_event
 
+            # Chunk boundary guards
+            if chunk_ts_start is not None and mbo.ts_event < chunk_ts_start:
+                continue
+            if chunk_ts_end is not None and mbo.ts_event >= chunk_ts_end:
+                break
+
             if progress_interval and count % progress_interval == 0:
+                pbar.update(progress_interval)
                 if progress_callback is not None:
                     try:
                         progress_callback(
@@ -565,8 +745,6 @@ class OrderTracker:
                         )
                     except Exception:
                         pass
-                else:
-                    print(f"Processed {count} messages - last_ts={last_ts}")
             if limit and count > limit:
                 break
 
@@ -660,6 +838,8 @@ class OrderTracker:
 
             self._spawn_virtuals_for_pending(day, book, best_bid, best_ask)
 
+        pbar.close()
+
         for v in self.active_virtual:
             if v.is_active():
                 v.on_censor("CENSORED_END")
@@ -701,3 +881,159 @@ class OrderTracker:
                 print(f"Skipped out-of-sequence book updates: {skipped_apply_errors}")
         except Exception:
             pass
+
+    def process_stream_parallel(
+        self,
+        file_path: str,
+        output_parquet: str,
+        n_workers: int = 4,
+        empty_points: Optional[List[int]] = None,
+        limit: int = None,
+        progress_interval: int = 100_000,
+        samples_per_day: int = 100,
+        target_day: Optional[str] = None,
+        empty_scan_verbose: bool = True,
+    ) -> None:
+        """
+        Parallel variant of :meth:`process_stream`.
+
+        Strategy
+        --------
+        1. **Scan pass** - stream the file once cheaply to find every
+           timestamp where the market book transitions from non-empty to
+           completely empty (:func:`find_empty_market_points`).  These are
+           valid split points because each chunk can begin with a clean
+           (empty) book state.
+        2. **Split** - pick ``n_workers - 1`` empty points that best
+           divide the timeline into *n_workers* equal-length intervals
+           (:func:`_select_split_points`).
+        3. **Parallel chunks** - each worker opens the file independently,
+           skips messages before its ``chunk_ts_start``, processes up to
+           its ``chunk_ts_end``, and writes to a private temp Parquet file.
+           Workers run in separate *processes* (``ProcessPoolExecutor``) to
+           bypass the GIL.
+        4. **Merge** - concatenate all temp Parquet files into
+           *output_parquet* in chunk order and remove the temp files.
+
+        Args:
+            file_path: Path to the DBN or DBN.ZST file.
+            output_parquet: Path to the final merged Parquet output.
+            n_workers: Number of parallel worker processes.
+            empty_points: Pre-computed list of empty-market timestamps (ns).
+                If *None* the scan pass is run automatically.
+            limit: Per-chunk message limit forwarded to
+                :meth:`process_stream`.
+            progress_interval: Progress-print interval forwarded to each
+                worker.
+            samples_per_day: Samples per trading day forwarded to each
+                worker.
+            target_day: Optional day filter forwarded to each worker.
+            empty_scan_verbose: Print progress during the scan pass.
+        """
+
+        # Discover split points
+        if empty_points is None:
+            print(f"[parallel] Scanning {file_path} for empty-market split points...")
+            empty_points = find_empty_market_points(
+                file_path, verbose=empty_scan_verbose
+            )
+            print(f"[parallel] Found {len(empty_points)} empty-market transitions.")
+
+        split_ts = _select_split_points(empty_points, n_workers)
+
+        # Build (ts_start, ts_end) pairs; None means "from beginning / to end"
+        boundaries: List[Optional[int]] = [None] + split_ts + [None]
+        chunks: List[tuple] = [
+            (boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1)
+        ]
+        actual_workers = len(chunks)
+        print(
+            f"[parallel] {actual_workers} chunk(s). "
+            f"Split timestamps (UTC ns): {split_ts}"
+        )
+
+        # Build per-worker kwargs
+        Path(output_parquet).parent.mkdir(parents=True, exist_ok=True)
+        temp_dir = tempfile.mkdtemp(prefix="lob_parallel_")
+        temp_files: List[str] = []
+        worker_args: List[dict] = []
+
+        for i, (ts_start, ts_end) in enumerate(chunks):
+            tmp = os.path.join(temp_dir, f"chunk_{i:03d}.parquet")
+            temp_files.append(tmp)
+            worker_args.append(
+                dict(
+                    _project_root=_PROJECT_ROOT,
+                    tracker_kwargs=dict(
+                        self._init_kwargs
+                    ),  # shallow copy of primitives
+                    file_path=file_path,
+                    output_parquet=tmp,
+                    chunk_ts_start=ts_start,
+                    chunk_ts_end=ts_end,
+                    chunk_idx=i,
+                    limit=limit,
+                    progress_interval=progress_interval,
+                    samples_per_day=samples_per_day,
+                    target_day=target_day,
+                    tqdm_position=i,
+                    tqdm_desc=f"Chunk {i:02d}",
+                )
+            )
+
+        # Process chunks in parallel
+        results: List[Optional[dict]] = [None] * actual_workers
+        with ProcessPoolExecutor(max_workers=actual_workers) as executor:
+            future_to_idx = {
+                executor.submit(_chunk_worker, args): args["chunk_idx"]
+                for args in worker_args
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    res = future.result()
+                    results[idx] = res
+                    self.inst.scheduled_virtual += res["scheduled_virtual"]
+                    self.inst.spawned_virtual += res["spawned_virtual"]
+                    print(
+                        f"[parallel] Chunk {idx} done - "
+                        f"scheduled={res['scheduled_virtual']}, "
+                        f"spawned={res['spawned_virtual']}"
+                    )
+                except Exception as exc:
+                    print(f"[parallel] Chunk {idx} raised an exception: {exc}")
+                    raise
+
+        # Merge temp Parquet files in chunk order
+        tables: List[pa.Table] = []
+        for i, tmp in enumerate(temp_files):
+            if os.path.exists(tmp):
+                tables.append(pq.read_table(tmp))
+            else:
+                print(f"[parallel] Warning: expected chunk file {tmp} not found.")
+
+        if tables:
+            merged = pa.concat_tables(tables, promote_options="default")
+            pq.write_table(merged, output_parquet)
+            print(
+                f"[parallel] Merged {len(tables)} chunk(s): "
+                f"{merged.num_rows:,} rows written to {output_parquet}"
+            )
+        else:
+            print("[parallel] No output produced - all chunks were empty.")
+
+        # Clean up temp files
+        for tmp in temp_files:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        try:
+            os.rmdir(temp_dir)
+        except OSError:
+            pass
+
+        print(
+            f"[parallel] Total: scheduled_virtual={self.inst.scheduled_virtual}, "
+            f"spawned_virtual={self.inst.spawned_virtual}"
+        )
