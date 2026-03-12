@@ -27,7 +27,7 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
     - Toxic fill identification
     - Time binning (via BaseTimeBinner)
     """
-    
+
     tox_bps: float = None
     tox_spread_bps: float = None
     tox_duration_s: float = None
@@ -53,7 +53,7 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
     def label(self, insertion_context: Dict[str, Any]) -> Dict[str, Any]:
         """
         Assign event type and time bin for a simulated order.
-        
+
         Args:
             insertion_context: dict with keys like:
                 - status_reason: "FILLED", "CENSORED_TIME", "PRICE_RUNAWAY", etc.
@@ -62,9 +62,9 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
                 - side: str, "B" or "A"
                 - best_bid_at_entry: int, best bid when order was placed
                 - best_ask_at_entry: int, best ask when order was placed
-                - best_bid_at_post_trade: int, best bid at the event window end after order filled
-                - best_ask_at_post_trade: int, best ask at the event window end after order filled
-        
+                - best_bid_at_post_trade: int, best bid at the post-trade time window end after order filled
+                - best_ask_at_post_trade: int, best ask at the post-trade time window end after order filled
+
         Returns:
             dict with keys:
                 - event_type: int from EventType enum
@@ -95,13 +95,15 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
             "event_time_bin": event_time_bin,
             "extras": extra,
         }
-    
-    def _classify_fill(self, insertion_context: Dict[str, Any]) -> tuple[EventType, Dict[str, Any]]:
+
+    def _classify_fill(
+        self, insertion_context: Dict[str, Any]
+    ) -> tuple[EventType, Dict[str, Any]]:
         """
         Classify a FILLED order as FAVORABLE_FILL or TOXIC_FILL.
-        
+
         Heuristics:
-        - Quick fills (< toxicity horizon) far from mid suggest good fills
+        - Quick fills (< toxicity horizon) with narrow spreads at entry suggest favorable fills
         - Slow fills with wide spreads or adverse mid movement suggest toxic fills
         """
 
@@ -122,9 +124,12 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
         if best_bid_at_post_trade is None or best_ask_at_post_trade is None:
             extra["post_trade_recorded"] = False
         else:
-            mid_price_at_post_trade = (best_bid_at_post_trade + best_ask_at_post_trade) / 2.0
+            mid_price_at_post_trade = (
+                best_bid_at_post_trade + best_ask_at_post_trade
+            ) / 2.0
             extra["post_trade_spread_bps"] = (
-                (best_ask_at_post_trade - best_bid_at_post_trade) / mid_price_at_post_trade
+                (best_ask_at_post_trade - best_bid_at_post_trade)
+                / mid_price_at_post_trade
             ) * 10000
             extra["post_trade_recorded"] = True
 
@@ -135,14 +140,23 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
         entry_spread_bps = (
             (best_ask_at_entry - best_bid_at_entry) / mid_price_at_entry
         ) * 10000
-            
+
         if extra["post_trade_recorded"]:
             if side == "B":
-                extra["post_trade_adverse_move_bps"] = ((entry_price - best_ask_at_post_trade) / entry_price) * 10000
+                # Adverse for a buy: midprice dropped after the fill
+                extra["post_trade_adverse_move_bps"] = (
+                    (mid_price_at_entry - mid_price_at_post_trade) / mid_price_at_entry
+                ) * 10000
             elif side == "A":
-                extra["post_trade_adverse_move_bps"] = ((best_bid_at_post_trade - entry_price) / entry_price) * 10000
+                # Adverse for a sell: midprice rose after the fill
+                extra["post_trade_adverse_move_bps"] = (
+                    (mid_price_at_post_trade - mid_price_at_entry) / mid_price_at_entry
+                ) * 10000
             # Favorable if adverse move is less than threshold
-            if extra["post_trade_adverse_move_bps"] is not None and extra["post_trade_adverse_move_bps"] < self.tox_bps:
+            if (
+                extra["post_trade_adverse_move_bps"] is not None
+                and extra["post_trade_adverse_move_bps"] <= self.tox_bps
+            ):
                 return EventType.FAVORABLE_FILL, extra
         else:
             if duration_s < self.tox_duration_s:

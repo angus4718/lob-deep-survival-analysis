@@ -21,7 +21,7 @@ from pathlib import Path
 import pandas as pd
 import databento as db
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Callable, Any
+from typing import Dict, List, Optional, Callable, Any, Tuple
 import random
 
 import pyarrow as pa
@@ -36,6 +36,7 @@ from .labeling.base import BaseLabeler
 from .labeling.competing_risks import ExecutionCompetingRisksLabeler
 from .features.base import BaseLOBTransform
 from .features.representation import RepresentationTransform
+from .features.compose import ToxicityFeatures, ComposeTransforms
 
 
 def _market_is_empty(market: Market) -> bool:
@@ -97,6 +98,78 @@ def find_empty_market_points(file_path: str, verbose: bool = True) -> List[int]:
     return empty_timestamps
 
 
+def count_messages_between_split_points(
+    file_path: str,
+    split_points: List[int],
+    verbose: bool = True,
+) -> Tuple[List[int], int]:
+    """
+    Count messages in each segment induced by ``split_points``.
+
+    Segment definition matches chunk guards used by ``process_stream``:
+    - Segment 0: ``ts_event < split_points[0]``
+    - Segment i: ``split_points[i-1] <= ts_event < split_points[i]``
+    - Last segment: ``ts_event >= split_points[-1]``
+
+    Args:
+        file_path: Path to DBN or DBN.ZST file.
+        split_points: Sorted split timestamps (ns).
+        verbose: Print progress while counting.
+
+    Returns:
+        Tuple of ``(messages_between_splits, total_messages)`` where
+        ``messages_between_splits`` has length ``len(split_points) + 1``.
+    """
+    data = db.DBNStore.from_file(file_path)
+    counts = [0] * (len(split_points) + 1)
+    split_idx = 0
+    total_messages = 0
+
+    for record in data:
+        total_messages += 1
+        ts_event = getattr(record, "ts_event", None)
+        if ts_event is None:
+            counts[-1] += 1
+            continue
+
+        while split_idx < len(split_points) and ts_event >= split_points[split_idx]:
+            split_idx += 1
+        counts[split_idx] += 1
+
+        if verbose and total_messages % 1_000_000 == 0:
+            print(f"  [count] {total_messages:,} messages counted")
+
+    if verbose:
+        print(
+            f"  [count] Finished. {total_messages:,} messages across "
+            f"{len(counts)} segment(s)."
+        )
+
+    return counts, total_messages
+
+
+def analyze_empty_market_splits(file_path: str, verbose: bool = True) -> dict:
+    """
+    Compute split metadata for progress accounting and cache it.
+
+    Returns a dict containing:
+    - ``split_points``: empty-market split timestamps.
+    - ``messages_between_splits``: exact message counts per split segment.
+    - ``total_messages``: total message count in the file.
+    """
+    split_points = find_empty_market_points(file_path=file_path, verbose=verbose)
+    segment_counts, total_messages = count_messages_between_split_points(
+        file_path=file_path,
+        split_points=split_points,
+        verbose=verbose,
+    )
+    return {
+        "split_points": split_points,
+        "messages_between_splits": segment_counts,
+        "total_messages": total_messages,
+    }
+
+
 def _select_split_points(empty_points: List[int], n: int) -> List[int]:
     """
     Choose ``n - 1`` timestamps from *empty_points* that divide the
@@ -121,6 +194,57 @@ def _select_split_points(empty_points: List[int], n: int) -> List[int]:
     for target in targets:
         best = min(empty_points, key=lambda t: abs(t - target))
         chosen.add(best)
+    return sorted(chosen)
+
+
+def _select_split_points_by_message_count(
+    empty_points: List[int],
+    messages_between_splits: List[int],
+    n: int,
+) -> List[int]:
+    """
+    Choose ``n - 1`` timestamps from *empty_points* that divide the
+    data into *n* chunks with roughly equal message counts, while ensuring
+    each chunk starts at an empty-market point.
+
+    Args:
+        empty_points: Sorted list of empty-market timestamps (ns).
+        messages_between_splits: Message counts for each segment between
+            consecutive empty points. Must have length len(empty_points) + 1.
+            Segment i contains messages between empty_points[i-1] and
+            empty_points[i] (or file boundaries).
+        n: Desired number of chunks.
+
+    Returns:
+        Sorted list of ``n - 1`` split timestamps that start empty-market
+        transitions and balance message counts across chunks.
+    """
+    if n <= 1 or not empty_points:
+        return []
+    if len(messages_between_splits) != len(empty_points) + 1:
+        # Fallback to time-based split if message counts don't match
+        return _select_split_points(empty_points, n)
+
+    # Build cumulative message counts at each empty point
+    # cumulative[i] = total messages from file start up to (but not including) empty_points[i]
+    cumulative = [0]
+    for i in range(len(empty_points)):
+        cumulative.append(cumulative[-1] + messages_between_splits[i])
+    total_messages = cumulative[-1] + messages_between_splits[-1]
+
+    # Target cumulative message count for each chunk boundary
+    target_cumulative = [i * total_messages // n for i in range(1, n)]
+
+    # For each target, find the closest empty point
+    chosen: set = set()
+    for target in target_cumulative:
+        # Find the empty point with cumulative closest to target
+        best_idx = min(
+            range(len(empty_points)),
+            key=lambda i: abs(cumulative[i + 1] - target),
+        )
+        chosen.add(empty_points[best_idx])
+
     return sorted(chosen)
 
 
@@ -155,6 +279,11 @@ def _chunk_worker(kwargs: dict) -> dict:
     chunk_idx: int = kwargs.pop("chunk_idx", 0)
     # Remaining keys forwarded to process_stream
     process_kwargs = kwargs
+
+    # Ensure output directory exists in worker process
+    import os
+
+    os.makedirs(os.path.dirname(output_parquet), exist_ok=True)
 
     tracker = OrderTracker(**tracker_kwargs)
     tracker.process_stream(
@@ -274,6 +403,9 @@ class TrackedOrder:
                 self, "best_ask_at_post_trade", None
             )
             base["entry_representation"] = getattr(self, "entry_representation", None)
+            base["toxicity_representation"] = getattr(
+                self, "toxicity_representation", None
+            )
 
         return base
 
@@ -294,7 +426,9 @@ class VirtualOrder(TrackedOrder):
     best_ask_at_entry: int = None
     best_bid_at_post_trade: int = None
     best_ask_at_post_trade: int = None
-    entry_representation: Optional[List] = None  # (lookback, 2W+1) 2-D list
+    post_trade_deadline_ts: Optional[int] = None
+    entry_representation: Optional[List] = None  # (lookback, 2W+1) market depth grid
+    toxicity_representation: Optional[List] = None  # (lookback, 18) toxicity metrics
 
     def __post_init__(self):
         self.order_type = "VIRTUAL"
@@ -322,9 +456,10 @@ class VirtualOrder(TrackedOrder):
         # Fill when no volume is ahead
         if self.current_vahead <= 0:
             self.on_fill(mbo)
-            # Start post-trade context tracking
-            self.post_trade_counter = 0
-            self.post_trade_window = CONFIG.labeling.tox_post_trade_move_window_events
+            # Start post-trade context tracking using a time-based horizon.
+            self.post_trade_deadline_ts = mbo.ts_event + int(
+                CONFIG.labeling.tox_post_trade_move_window_ms * 1e6
+            )
             return
 
         # Adjust volume ahead in response to cancels/fills/modifies
@@ -402,6 +537,7 @@ class OrderTracker:
         self.representation_transform = (
             representation_transform or RepresentationTransform()
         )
+        self.toxicity_features = ToxicityFeatures()
         self.include_representation = include_representation
 
         self.lookback_period = lookback_period
@@ -542,11 +678,13 @@ class OrderTracker:
     def _update_post_trade_virtual(
         self, mbo, book, out_buffer, parquet_writer, parquet_batch_size, output_parquet
     ):
-        """Update post-trade virtuals, increment counter, and capture BBO at window end."""
+        """Update post-trade virtuals and capture BBO once the time horizon is reached."""
         next_post_trade_virtual = []
         for v in self.post_trade_virtual:
-            v.post_trade_counter += 1
-            if v.post_trade_counter >= v.post_trade_window:
+            if (
+                v.post_trade_deadline_ts is not None
+                and mbo.ts_event >= v.post_trade_deadline_ts
+            ):
                 v.record_post_trade_context(book)
                 out_buffer, parquet_writer = self._append_completed_order(
                     out_buffer,
@@ -572,6 +710,8 @@ class OrderTracker:
         while pending_v:
             scheduled_ts = pending_v.pop(0)
             entry_representation = None
+            toxicity_representation = None
+
             if (
                 self.include_representation
                 and self.representation_transform is not None
@@ -583,8 +723,17 @@ class OrderTracker:
                             buf, self.lookback_period
                         ).tolist()
                     )
+                    # Also extract toxicity features
+                    if self.toxicity_features is not None:
+                        tox_tensor = (
+                            self.toxicity_features.transform_sequence_from_dicts(
+                                buf, self.lookback_period
+                            )
+                        )
+                        toxicity_representation = tox_tensor.tolist()
                 except Exception:
                     entry_representation = None
+                    toxicity_representation = None
 
             bid_level_orders = book.bids.get(best_bid.price)
             if not bid_level_orders:
@@ -616,6 +765,7 @@ class OrderTracker:
                 best_bid_at_entry=best_bid.price if best_bid else None,
                 best_ask_at_entry=best_ask.price if best_ask else None,
                 entry_representation=entry_representation,
+                toxicity_representation=toxicity_representation,
             )
             self.active_virtual.append(v)
             self.virtual_oid_counter += 1
@@ -651,6 +801,7 @@ class OrderTracker:
                 best_bid_at_entry=best_bid.price if best_bid else None,
                 best_ask_at_entry=best_ask.price if best_ask else None,
                 entry_representation=entry_representation,
+                toxicity_representation=toxicity_representation,
             )
             self.active_virtual.append(v)
             self.virtual_oid_counter += 1
@@ -671,6 +822,7 @@ class OrderTracker:
         chunk_ts_end: Optional[int] = None,
         tqdm_position: Optional[int] = None,
         tqdm_desc: Optional[str] = None,
+        tqdm_total: Optional[int] = None,
     ):
         """
         Stream MBO messages from `file_path` and write tracked orders.
@@ -701,8 +853,25 @@ class OrderTracker:
         _desc = tqdm_desc or (
             f"Chunk {tqdm_position}" if tqdm_position is not None else "Processing"
         )
+
+        # Use explicit total when provided (e.g., cached exact counts for chunk).
+        # Otherwise, fall back to an estimate derived from record size.
+        _total = tqdm_total
+        if _total is None:
+            try:
+                _peek = db.DBNStore.from_file(file_path)
+                _first_byte = _peek.reader.read(1)
+                del _peek
+                _rec_size = _first_byte[0] * 4 if _first_byte else 0
+                _total = (data.nbytes // _rec_size) if _rec_size > 0 else None
+            except Exception:
+                _total = None
+        if _total and limit:
+            _total = min(_total, limit)
+
         pbar = tqdm(
             desc=_desc,
+            total=_total,
             unit=" msg",
             position=tqdm_position,
             leave=True,
@@ -723,38 +892,38 @@ class OrderTracker:
         if target_day is not None:
             target_day_date = pd.Timestamp(target_day).date()
         target_day_seen = False
+        chunk_count = 0  # Counter for messages within this chunk
 
         for mbo in data:
             count += 1
             last_ts = mbo.ts_event
 
-            # Chunk boundary guards
+            # Chunk boundary guards - check these first before updating progress
             if chunk_ts_start is not None and mbo.ts_event < chunk_ts_start:
                 continue
             if chunk_ts_end is not None and mbo.ts_event >= chunk_ts_end:
                 break
+            if limit and count > limit:
+                break
 
-            if progress_interval and count % progress_interval == 0:
+            # Message is within chunk boundaries, increment chunk counter
+            chunk_count += 1
+
+            # Update the progress bar only for messages within this chunk
+            if progress_interval and chunk_count % progress_interval == 0:
                 pbar.update(progress_interval)
                 if progress_callback is not None:
                     try:
                         progress_callback(
-                            count,
+                            chunk_count,
                             last_ts,
                             len(self.active_virtual),
                         )
                     except Exception:
                         pass
-            if limit and count > limit:
-                break
 
-            # Update market state first to preserve continuity for in-session cancels/modifies.
-            try:
-                self.market.apply(mbo)
-            except (KeyError, AssertionError):
-                skipped_apply_errors += 1
-                continue
-
+            # Determine which trading day this message belongs to (for trading hours check)
+            # This must happen before market state updates to enable early exit for out-of-hours
             msg_day = int(mbo.ts_event // (86400 * 1e9))
             if msg_day != current_day:
                 ts_dt = pd.to_datetime(mbo.ts_event, unit="ns", utc=True).tz_convert(
@@ -770,6 +939,16 @@ class OrderTracker:
                 local_date = ts_dt.date()
                 current_day = msg_day
 
+            # EARLY EXIT: Skip expensive operations for messages outside trading hours.
+            # Still update market state for book continuity, but skip order tracking work.
+            if last_ts < day_start_ns or last_ts > day_end_ns:
+                # Update market to keep book state accurate for next in-hours message
+                try:
+                    self.market.apply(mbo)
+                except (KeyError, AssertionError):
+                    skipped_apply_errors += 1
+                continue
+
             if target_day_date is not None:
                 if local_date < target_day_date:
                     continue
@@ -779,7 +958,11 @@ class OrderTracker:
                     continue
                 target_day_seen = True
 
-            if last_ts < day_start_ns or last_ts > day_end_ns:
+            # Update market state for in-hours messages
+            try:
+                self.market.apply(mbo)
+            except (KeyError, AssertionError):
+                skipped_apply_errors += 1
                 continue
 
             day = local_date
@@ -893,6 +1076,8 @@ class OrderTracker:
         samples_per_day: int = 100,
         target_day: Optional[str] = None,
         empty_scan_verbose: bool = True,
+        messages_between_splits: Optional[List[int]] = None,
+        total_messages: Optional[int] = None,
     ) -> None:
         """
         Parallel variant of :meth:`process_stream`.
@@ -939,7 +1124,85 @@ class OrderTracker:
             )
             print(f"[parallel] Found {len(empty_points)} empty-market transitions.")
 
-        split_ts = _select_split_points(empty_points, n_workers)
+        # Use message-count-aware selection if available, otherwise fall back to time-based
+        if (
+            messages_between_splits is not None
+            and len(messages_between_splits) == len(empty_points) + 1
+        ):
+            split_ts = _select_split_points_by_message_count(
+                empty_points, messages_between_splits, n_workers
+            )
+        else:
+            split_ts = _select_split_points(empty_points, n_workers)
+        # Derive per-chunk progress totals.
+        # Preferred path: exact cached counts projected onto selected split_ts.
+        cumulative_chunk_totals: Optional[List[int]] = None
+
+        def _per_chunk_total(_: Optional[int]) -> Optional[int]:
+            return None
+
+        if (
+            messages_between_splits is not None
+            and empty_points is not None
+            and len(messages_between_splits) == len(empty_points) + 1
+        ):
+            try:
+                # Build exact cumulative totals for each selected split boundary:
+                # total messages with ts_event < split_ts[i].
+                running = 0
+                total_before_point: Dict[int, int] = {}
+                for i, split_point in enumerate(empty_points):
+                    total_before_point[int(split_point)] = running
+                    running += int(messages_between_splits[i])
+
+                calculated_total = running + int(messages_between_splits[-1])
+                resolved_total = (
+                    int(total_messages)
+                    if total_messages is not None
+                    else int(calculated_total)
+                )
+
+                per_split = [total_before_point.get(int(ts)) for ts in split_ts]
+                if all(v is not None for v in per_split):
+                    cumulative_chunk_totals = [int(v) for v in per_split]
+                    cumulative_chunk_totals.append(resolved_total)
+                    # Prepend 0 so we can compute per-chunk totals as cum[i+1] - cum[i]
+                    cumulative_chunk_totals = [0] + cumulative_chunk_totals
+            except Exception:
+                cumulative_chunk_totals = None
+
+        # Fallback path: estimate from byte-size/time-span when exact counts
+        # are unavailable or mismatched.
+        if cumulative_chunk_totals is None:
+            try:
+                _peek = db.DBNStore.from_file(file_path)
+                _first_byte = _peek.reader.read(1)
+                _rec_size_p = _first_byte[0] * 4 if _first_byte else 0
+                _full_records: Optional[int] = (
+                    (_peek.nbytes // _rec_size_p) if _rec_size_p > 0 else None
+                )
+                _file_ts_start: Optional[int] = _peek.metadata.start
+                _file_ts_end: Optional[int] = _peek.metadata.end
+                del _peek
+            except Exception:
+                _full_records = None
+                _file_ts_start = None
+                _file_ts_end = None
+
+            def _per_chunk_total(ts_end: Optional[int]) -> Optional[int]:
+                """Records from file start up to ts_end (None means full file)."""
+                if (
+                    _full_records is None
+                    or _file_ts_start is None
+                    or _file_ts_end is None
+                ):
+                    return None
+                if ts_end is None:
+                    return _full_records
+                ts_range = _file_ts_end - _file_ts_start
+                if ts_range <= 0:
+                    return _full_records
+                return max(1, int(_full_records * (ts_end - _file_ts_start) / ts_range))
 
         # Build (ts_start, ts_end) pairs; None means "from beginning / to end"
         boundaries: List[Optional[int]] = [None] + split_ts + [None]
@@ -947,6 +1210,11 @@ class OrderTracker:
             (boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1)
         ]
         actual_workers = len(chunks)
+        if (
+            cumulative_chunk_totals is not None
+            and len(cumulative_chunk_totals) != actual_workers + 1
+        ):
+            cumulative_chunk_totals = None
         print(
             f"[parallel] {actual_workers} chunk(s). "
             f"Split timestamps (UTC ns): {split_ts}"
@@ -961,6 +1229,17 @@ class OrderTracker:
         for i, (ts_start, ts_end) in enumerate(chunks):
             tmp = os.path.join(temp_dir, f"chunk_{i:03d}.parquet")
             temp_files.append(tmp)
+
+            # Calculate per-chunk total (not cumulative)
+            chunk_total = None
+            if cumulative_chunk_totals is not None:
+                # Convert cumulative to per-chunk: chunk_i total = cum[i+1] - cum[i]
+                chunk_total = int(
+                    cumulative_chunk_totals[i + 1] - cumulative_chunk_totals[i]
+                )
+            else:
+                chunk_total = _per_chunk_total(ts_end)
+
             worker_args.append(
                 dict(
                     _project_root=_PROJECT_ROOT,
@@ -978,6 +1257,7 @@ class OrderTracker:
                     target_day=target_day,
                     tqdm_position=i,
                     tqdm_desc=f"Chunk {i:02d}",
+                    tqdm_total=chunk_total,
                 )
             )
 
