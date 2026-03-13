@@ -437,22 +437,6 @@ class VirtualOrder(TrackedOrder):
         if not self.is_active():
             return
 
-        b, a = book.bbo()
-        best_bid_px = b.price if b else None
-        best_ask_px = a.price if a else None
-
-        # PRICE RUNAWAY DETECTION
-        if self.side == "B" and best_bid_px is not None:
-            price_move_bps = ((self.price - best_bid_px) / self.price) * 10000
-            if price_move_bps > CONFIG.labeling.price_runaway_bps:
-                self.on_censor("PRICE_RUNAWAY", mbo)
-                return
-        elif self.side == "A" and best_ask_px is not None:
-            price_move_bps = ((best_ask_px - self.price) / self.price) * 10000
-            if price_move_bps > CONFIG.labeling.price_runaway_bps:
-                self.on_censor("PRICE_RUNAWAY", mbo)
-                return
-
         # Fill when no volume is ahead
         if self.current_vahead <= 0:
             self.on_fill(mbo)
@@ -505,12 +489,14 @@ class OrderTracker:
 
     Args:
         samples_per_day: Target number of samples per trading day.
+        time_censor_s: Maximum lifetime in seconds before an active order is
+            censored as CENSORED_TIME.
     """
 
     def __init__(
         self,
         samples_per_day: int = 100,
-        time_censor_s: float = 300.0,
+        time_censor_s: float = CONFIG.time_binning.max_time_s,
         labeler: Optional[BaseLabeler] = None,
         representation_transform: Optional[BaseLOBTransform] = None,
         include_representation: bool = True,
@@ -525,7 +511,6 @@ class OrderTracker:
         self.last_sample_time = 0
         self.virtual_oid_counter = 0
 
-        # Time censor threshold (nanoseconds)
         self.time_censor_ns = int(time_censor_s * 1e9)
 
         self.samples_per_day = samples_per_day
@@ -656,10 +641,8 @@ class OrderTracker:
         next_active_virtual = []
         for v in self.active_virtual:
             v.update(mbo, book, self.market)
-            # Time censoring
             if v.is_active() and (mbo.ts_event - v.entry_time > self.time_censor_ns):
                 v.on_censor("CENSORED_TIME", mbo)
-
             if v.is_active():
                 next_active_virtual.append(v)
             elif v.status == "FILLED":
@@ -673,6 +656,47 @@ class OrderTracker:
                     v,
                 )
         self.active_virtual = next_active_virtual
+        return out_buffer, parquet_writer
+
+    def _close_open_orders_for_day_end(
+        self,
+        day_end_ts: int,
+        book,
+        out_buffer,
+        parquet_writer,
+        parquet_batch_size,
+        output_parquet,
+    ):
+        """Finalize all open orders at regular-session end for the trading day."""
+        if self.active_virtual:
+            for v in self.active_virtual:
+                if v.is_active():
+                    v.on_censor("CENSORED_END")
+                    v.end_time = day_end_ts
+                out_buffer, parquet_writer = self._append_completed_order(
+                    out_buffer,
+                    parquet_writer,
+                    output_parquet,
+                    parquet_batch_size,
+                    v,
+                )
+            self.active_virtual = []
+
+        if self.post_trade_virtual:
+            for v in self.post_trade_virtual:
+                if book is not None:
+                    v.record_post_trade_context(book)
+                if getattr(v, "end_time", 0) == 0:
+                    v.end_time = day_end_ts
+                out_buffer, parquet_writer = self._append_completed_order(
+                    out_buffer,
+                    parquet_writer,
+                    output_parquet,
+                    parquet_batch_size,
+                    v,
+                )
+            self.post_trade_virtual = []
+
         return out_buffer, parquet_writer
 
     def _update_post_trade_virtual(
@@ -883,6 +907,7 @@ class OrderTracker:
         out_buffer: List[dict] = []
 
         current_day = None
+        current_local_date = None
         day_start_ns = None
         day_end_ns = None
         inst = self.inst
@@ -937,6 +962,26 @@ class OrderTracker:
                 day_start_ns = int(day_start_dt.tz_convert("UTC").value)
                 day_end_ns = int(day_end_dt.tz_convert("UTC").value)
                 local_date = ts_dt.date()
+
+                if current_local_date is not None and local_date != current_local_date:
+                    out_buffer, parquet_writer = self._close_open_orders_for_day_end(
+                        day_end_ts=int(
+                            (
+                                pd.Timestamp(current_local_date)
+                                .tz_localize("America/New_York")
+                                .replace(hour=16, minute=0)
+                                .tz_convert("UTC")
+                                .value
+                            )
+                        ),
+                        book=None,
+                        out_buffer=out_buffer,
+                        parquet_writer=parquet_writer,
+                        parquet_batch_size=parquet_batch_size,
+                        output_parquet=output_parquet,
+                    )
+
+                current_local_date = local_date
                 current_day = msg_day
 
             # EARLY EXIT: Skip expensive operations for messages outside trading hours.
@@ -947,6 +992,23 @@ class OrderTracker:
                     self.market.apply(mbo)
                 except (KeyError, AssertionError):
                     skipped_apply_errors += 1
+
+                if last_ts > day_end_ns:
+                    day_end_book = None
+                    try:
+                        day_end_book = self.market.get_book(
+                            mbo.instrument_id, mbo.publisher_id
+                        )
+                    except KeyError:
+                        pass
+                    out_buffer, parquet_writer = self._close_open_orders_for_day_end(
+                        day_end_ts=day_end_ns,
+                        book=day_end_book,
+                        out_buffer=out_buffer,
+                        parquet_writer=parquet_writer,
+                        parquet_batch_size=parquet_batch_size,
+                        output_parquet=output_parquet,
+                    )
                 continue
 
             if target_day_date is not None:

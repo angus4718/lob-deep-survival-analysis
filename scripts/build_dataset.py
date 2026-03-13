@@ -1,24 +1,31 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
+import multiprocessing
 from pathlib import Path
-
-import pandas as pd
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 
 # Ensure project root is in sys.path for src imports
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.order_tracking import OrderTracker
+from src.order_tracking import (
+    OrderTracker,
+    analyze_empty_market_splits,
+    count_messages_between_split_points,
+)
+from src.config import CONFIG
 
 SYMBOL = "AAPL"
 START_DATE = "2025-12-01"
 END_DATE = "2026-01-01"
 
-SAMPLES_PER_DAY = 100
-TIME_CENSOR_S = 300.0
+SAMPLES_PER_DAY = 1000
+TIME_CENSOR_S = CONFIG.time_binning.max_time_s
 LOOKBACK_PERIOD = 20
 PROGRESS_INTERVAL = 100_000
 
@@ -26,17 +33,84 @@ PROGRESS_INTERVAL = 100_000
 # or None to process the entire file.
 TARGET_DAY = None  # e.g. "2025-12-01"
 
-# Number of parallel worker processes.
-N_WORKERS = 20
+# Set the number of parallel worker processes,
+# or None to auto-select based on available CPU cores (leaving 2 cores free).
+N_WORKERS = None
 
 FILE_NAME = (
     f"XNAS_ITCH_{SYMBOL}_mbo_{START_DATE.replace('-', '')}_{END_DATE.replace('-', '')}"
 )
 dbn_path = Path("data") / "raw" / f"{FILE_NAME}.dbn.zst"
 output_path = Path("data") / "datasets" / f"dataset_{FILE_NAME}.parquet"
+split_cache_path = Path("data") / "datasets" / f"{FILE_NAME}_split_points.json"
+
+
+def _load_or_build_split_cache(cache_path: Path, dbn_file: Path) -> dict:
+    """Load cached split metadata or build it on first run."""
+    if cache_path.exists():
+        with open(cache_path) as f:
+            cached = json.load(f)
+
+        if isinstance(cached, dict) and {
+            "split_points",
+            "messages_between_splits",
+            "total_messages",
+        }.issubset(cached.keys()):
+            print(
+                "[cache] Loaded split metadata: "
+                f"{len(cached['split_points'])} split points, "
+                f"{cached['total_messages']:,} total messages"
+            )
+            return cached
+
+        if isinstance(cached, list):
+            print(
+                "[cache] Legacy split-point cache detected. "
+                "Computing message counts and upgrading cache format..."
+            )
+            split_points = cached
+            counts, total_messages = count_messages_between_split_points(
+                file_path=str(dbn_file),
+                split_points=split_points,
+                verbose=True,
+            )
+            upgraded = {
+                "version": 2,
+                "split_points": split_points,
+                "messages_between_splits": counts,
+                "total_messages": total_messages,
+            }
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, "w") as f:
+                json.dump(upgraded, f)
+            print(f"[cache] Upgraded cache written to {cache_path}")
+            return upgraded
+
+        print("[cache] Cache format not recognized. Rebuilding split metadata...")
+
+    print(f"[cache] No valid cache found - scanning {dbn_file} for split metadata...")
+    analyzed = analyze_empty_market_splits(file_path=str(dbn_file), verbose=True)
+    analyzed["version"] = 2
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "w") as f:
+        json.dump(analyzed, f)
+    print(
+        "[cache] Saved split metadata: "
+        f"{len(analyzed['split_points'])} split points, "
+        f"{analyzed['total_messages']:,} total messages"
+    )
+    return analyzed
 
 
 def main() -> None:
+    global N_WORKERS
+    if N_WORKERS is None:
+        total_cores = multiprocessing.cpu_count()
+        N_WORKERS = max(1, total_cores - 2)
+        print(
+            f"Auto-selected {N_WORKERS} workers based on {total_cores} available cores."
+        )
+
     if not os.path.exists(dbn_path):
         print(f"File {dbn_path} not found.")
         return
@@ -51,10 +125,19 @@ def main() -> None:
 
     if N_WORKERS > 1:
         print(f"Running in parallel mode with {N_WORKERS} workers.")
+
+        split_cache = _load_or_build_split_cache(split_cache_path, dbn_path)
+        empty_points = split_cache.get("split_points", [])
+        messages_between_splits = split_cache.get("messages_between_splits")
+        total_messages = split_cache.get("total_messages")
+
         tracker.process_stream_parallel(
             file_path=str(dbn_path),
             output_parquet=str(output_path),
             n_workers=N_WORKERS,
+            empty_points=empty_points,
+            messages_between_splits=messages_between_splits,
+            total_messages=total_messages,
             progress_interval=PROGRESS_INTERVAL,
             samples_per_day=SAMPLES_PER_DAY,
             target_day=TARGET_DAY,
@@ -70,29 +153,27 @@ def main() -> None:
             target_day=TARGET_DAY,
         )
 
-    df = pd.read_parquet(output_path)
-    print("shape:", df.shape)
-    print("columns:", list(df.columns))
+    parquet_file = pq.ParquetFile(output_path)
+    columns = parquet_file.schema.names
+    shape = (parquet_file.metadata.num_rows, len(columns))
+
+    print("shape:", shape)
+    print("columns:", columns)
 
     print("\nEvent type distribution:")
-    print(df["event_type"].value_counts(dropna=False).sort_index())
+    if "event_type" not in columns:
+        print("event_type column not found")
+        return
+
+    event_col = pq.read_table(output_path, columns=["event_type"])["event_type"]
+    counts = pc.value_counts(event_col).to_pylist()
+    counts_sorted = sorted(
+        counts,
+        key=lambda x: (x["values"] is None, x["values"]),
+    )
+    for row in counts_sorted:
+        print(f"{row['values']}: {row['counts']}")
 
 
 if __name__ == "__main__":
     main()
-"""
-[parallel] Found 28 empty-market transitions.
-[parallel] 17 chunk(s). Split timestamps (UTC ns): [1764749102426337186, 1764835502538123401, 1764921902657087068, 1765181105923313585, 1765267501489234482, 1765353897623140716, 1765526701745496793, 1765785892856718339, 1765872295424774199, 1766045092238363115, 1766134800131914751, 1766390703422316446, 1766563491896459827, 1766613600229985855, 1766995503018619276, 1767081888103273843]
-[parallel] Merged 17 chunk(s): 2,200 rows written to data\datasets\dataset_XNAS_ITCH_AAPL_mbo_20251201_20260101.parquet
-[parallel] Total: scheduled_virtual=2200, spawned_virtual=2200
-shape: (2200, 19)
-columns: ['order_id', 'entry_time', 'duration_s', 'event', 'status_reason', 'price', 'side', 'volume', 'order_type', 'best_bid_at_entry', 'best_ask_at_entry', 'best_bid_at_post_trade', 'best_ask_at_post_trade', 'entry_representation', 'event_type', 'event_time_bin', 'post_trade_adverse_move_bps', 'post_trade_spread_bps', 'post_trade_recorded']
-
-Event type distribution:
-event_type
-0      49
-1    2001
-2     133
-3      17
-Name: count, dtype: int64
-"""

@@ -11,7 +11,6 @@ class EventType(IntEnum):
     CENSORED = 0
     FAVORABLE_FILL = 1
     TOXIC_FILL = 2
-    RUNAWAY = 3
 
     @classmethod
     def is_valid(cls, value: int) -> bool:

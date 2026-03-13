@@ -14,7 +14,6 @@ class DataConfig:
     price_unit: int = 1e9  # DataBento prices are in 'nanodollars'.
     t_max_s: float = 10.0
     tox_horizon_s: float = 1.0
-    runaway_delta_ticks: int = 5
 
 
 @dataclass(frozen=True)
@@ -27,7 +26,6 @@ class FeatureConfig:
 
 @dataclass(frozen=True)
 class LabelingConfig:
-    price_runaway_bps: float = 1.0  # basis points
     tox_bps: float = 0.2  # bps, indicator of unfavorable fill
     tox_spread_bps: float = 0.2  # use for market condition checks
     tox_duration_s: float = 60

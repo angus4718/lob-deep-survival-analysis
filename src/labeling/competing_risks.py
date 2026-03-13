@@ -4,7 +4,6 @@ ExecutionCompetingRisksLabeler: Assigns event type and time bin for each simulat
 - 0: CENSORED
 - 1: FAVORABLE_FILL
 - 2: TOXIC_FILL
-- 3: RUNAWAY
 
 Consistent with EventType enum in domain/enums.py.
 """
@@ -23,7 +22,6 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
     """
     Labels completed orders into competing risk event types.
     Uses configurable thresholds from LabelingConfig for:
-    - Price runaway detection
     - Toxic fill identification
     - Time binning (via BaseTimeBinner)
     """
@@ -56,7 +54,7 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
 
         Args:
             insertion_context: dict with keys like:
-                - status_reason: "FILLED", "CENSORED_TIME", "PRICE_RUNAWAY", etc.
+                - status_reason: "FILLED", "CENSORED_TIME", "CENSORED_END", etc.
                 - duration_s: float, lifetime of the order in seconds
                 - price: int, entry price (in price units)
                 - side: str, "B" or "A"
@@ -77,9 +75,6 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
         # Determine event type and extras
         if status_reason == "FILLED":
             event_type, extra = self._classify_fill(insertion_context)
-        elif status_reason == "PRICE_RUNAWAY":
-            event_type = EventType.RUNAWAY
-            extra = {}
         elif status_reason in ["CENSORED_TIME", "CENSORED_END"]:
             event_type = EventType.CENSORED
             extra = {}
