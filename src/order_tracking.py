@@ -409,6 +409,9 @@ class TrackedOrder:
             base["toxicity_representation"] = getattr(
                 self, "toxicity_representation", None
             )
+            base["lob_sequence"] = getattr(self, "lob_sequence", None)
+            base["toxicity_sequence"] = getattr(self, "toxicity_sequence", None)
+            base["sequence_length"] = len(getattr(self, "lob_sequence", []) or [])
 
         return base
 
@@ -430,8 +433,10 @@ class VirtualOrder(TrackedOrder):
     best_bid_at_post_trade: int = None
     best_ask_at_post_trade: int = None
     post_trade_deadline_ts: Optional[int] = None
-    entry_representation: Optional[List] = None  # (lookback, 2W+1) market depth grid
-    toxicity_representation: Optional[List] = None  # (lookback, 18) toxicity metrics
+    entry_representation: Optional[List] = None  # (T_hist, 2W+1), no padding
+    toxicity_representation: Optional[List] = None  # (T_hist, 18), no padding
+    lob_sequence: List[List[float]] = field(default_factory=list)  # (T_var, 2W+1)
+    toxicity_sequence: List[List[float]] = field(default_factory=list)  # (T_var, 18)
 
     def __post_init__(self):
         self.order_type = "VIRTUAL"
@@ -757,6 +762,83 @@ class OrderTracker:
         self.post_trade_virtual = next_post_trade_virtual
         return out_buffer, parquet_writer
 
+    def _get_entry_feature_sequences(
+        self,
+    ) -> tuple[List[List[float]], List[List[float]]]:
+        """Build variable-length historical sequences from the snapshot buffer."""
+        if not self.include_representation or self.representation_transform is None:
+            return [], []
+
+        buf = list(self._lob_snapshot_buffer)
+        if not buf:
+            return [], []
+
+        entry_representation: List[List[float]] = []
+        toxicity_representation: List[List[float]] = []
+        try:
+            entry_tensor = self.representation_transform.transform_sequence_from_dicts(
+                buf,
+                self.lookback_period,
+                pad_to_length=False,
+            )
+            entry_representation = entry_tensor.tolist()
+
+            if self.toxicity_features is not None:
+                tox_tensor = self.toxicity_features.transform_sequence_from_dicts(
+                    buf,
+                    self.lookback_period,
+                    pad_to_length=False,
+                )
+                toxicity_representation = tox_tensor.tolist()
+        except Exception:
+            return [], []
+
+        return entry_representation, toxicity_representation
+
+    def _append_snapshot_to_active_virtuals(
+        self, bids_snap: Dict[int, int], asks_snap: Dict[int, int]
+    ) -> None:
+        """Append one feature step to active orders so sequence length follows wait time."""
+        if (
+            not self.active_virtual
+            or not self.include_representation
+            or self.representation_transform is None
+        ):
+            return
+
+        lob_step: Optional[List[float]] = None
+        tox_step: Optional[List[float]] = None
+        snapshot = [(bids_snap, asks_snap)]
+
+        try:
+            lob_tensor = self.representation_transform.transform_sequence_from_dicts(
+                snapshot,
+                n_lookback=1,
+                pad_to_length=False,
+            )
+            if lob_tensor.shape[0] > 0:
+                lob_step = lob_tensor[-1].tolist()
+        except Exception:
+            lob_step = None
+
+        if self.toxicity_features is not None:
+            try:
+                tox_tensor = self.toxicity_features.transform_sequence_from_dicts(
+                    snapshot,
+                    n_lookback=1,
+                    pad_to_length=False,
+                )
+                if tox_tensor.shape[0] > 0:
+                    tox_step = tox_tensor[-1].tolist()
+            except Exception:
+                tox_step = None
+
+        for v in self.active_virtual:
+            if lob_step is not None:
+                v.lob_sequence.append(list(lob_step))
+            if tox_step is not None:
+                v.toxicity_sequence.append(list(tox_step))
+
     def _spawn_virtuals_for_pending(self, day, book, best_bid, best_ask):
         """
         Spawn virtual orders for any pending scheduled timestamps.
@@ -768,31 +850,12 @@ class OrderTracker:
         pending_v = self.pending_virtual.get(day, [])
         while pending_v:
             scheduled_ts = pending_v.pop(0)
-            entry_representation = None
-            toxicity_representation = None
+            entry_representation, toxicity_representation = (
+                self._get_entry_feature_sequences()
+            )
 
-            if (
-                self.include_representation
-                and self.representation_transform is not None
-            ):
-                try:
-                    buf = list(self._lob_snapshot_buffer)
-                    entry_representation = (
-                        self.representation_transform.transform_sequence_from_dicts(
-                            buf, self.lookback_period
-                        ).tolist()
-                    )
-                    # Also extract toxicity features
-                    if self.toxicity_features is not None:
-                        tox_tensor = (
-                            self.toxicity_features.transform_sequence_from_dicts(
-                                buf, self.lookback_period
-                            )
-                        )
-                        toxicity_representation = tox_tensor.tolist()
-                except Exception:
-                    entry_representation = None
-                    toxicity_representation = None
+            initial_lob_sequence = [list(row) for row in entry_representation]
+            initial_tox_sequence = [list(row) for row in toxicity_representation]
 
             bid_level_orders = book.bids.get(best_bid.price)
             if not bid_level_orders:
@@ -825,6 +888,8 @@ class OrderTracker:
                 best_ask_at_entry=best_ask.price if best_ask else None,
                 entry_representation=entry_representation,
                 toxicity_representation=toxicity_representation,
+                lob_sequence=[list(row) for row in initial_lob_sequence],
+                toxicity_sequence=[list(row) for row in initial_tox_sequence],
             )
             self.active_virtual.append(v)
             self.virtual_oid_counter += 1
@@ -861,6 +926,8 @@ class OrderTracker:
                 best_ask_at_entry=best_ask.price if best_ask else None,
                 entry_representation=entry_representation,
                 toxicity_representation=toxicity_representation,
+                lob_sequence=[list(row) for row in initial_lob_sequence],
+                toxicity_sequence=[list(row) for row in initial_tox_sequence],
             )
             self.active_virtual.append(v)
             self.virtual_oid_counter += 1
@@ -1098,6 +1165,7 @@ class OrderTracker:
                 }
                 self._lob_snapshot_buffer.append((bids_snap, asks_snap))
                 self._last_snapshot_ts = mbo.ts_event
+                self._append_snapshot_to_active_virtuals(bids_snap, asks_snap)
 
             out_buffer, parquet_writer = self._update_active_virtual(
                 mbo,

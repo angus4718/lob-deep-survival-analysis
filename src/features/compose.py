@@ -345,8 +345,9 @@ class ToxicityFeatures(BaseLOBTransform):
         self,
         snapshots: Sequence[tuple],
         n_lookback: int,
+        pad_to_length: bool = True,
     ) -> torch.Tensor:
-        """Convert sequence of (bids_dict, asks_dict) tuples into (n_lookback, 18) tensor.
+        """Convert bid/ask snapshots into toxicity feature time series.
 
         Computes 18 toxicity metrics for each snapshot in the lookback window,
         producing a time series where each feature evolves over the lookback period.
@@ -362,11 +363,16 @@ class ToxicityFeatures(BaseLOBTransform):
             - Each row is one snapshot in the lookback period
             - Each column is one of 18 toxicity metrics
             - All features are raw (unscaled) values
+
+            If ``pad_to_length=False``, returns shape ``(T, 18)`` where ``T``
+            is the number of available snapshots.
         """
         feature_dim = self._feature_dim()
 
         if not snapshots:
-            return torch.zeros((n_lookback, feature_dim), dtype=torch.float32)
+            if pad_to_length:
+                return torch.zeros((n_lookback, feature_dim), dtype=torch.float32)
+            return torch.zeros((0, feature_dim), dtype=torch.float32)
 
         # Extract features for each snapshot
         features_list = []
@@ -378,7 +384,13 @@ class ToxicityFeatures(BaseLOBTransform):
         if features_list:
             result = torch.stack(features_list, dim=0)
         else:
-            result = torch.zeros((0, feature_dim), dtype=torch.float32)
+            if pad_to_length:
+                result = torch.zeros((n_lookback, feature_dim), dtype=torch.float32)
+            else:
+                result = torch.zeros((0, feature_dim), dtype=torch.float32)
+
+        if not pad_to_length:
+            return result
 
         # Pad or truncate to exactly n_lookback timesteps
         T = result.shape[0]
