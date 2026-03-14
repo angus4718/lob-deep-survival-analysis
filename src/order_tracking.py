@@ -18,6 +18,7 @@ import os
 import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from uuid import uuid4
 import pandas as pd
 import databento as db
 from dataclasses import dataclass, field
@@ -37,6 +38,13 @@ from .labeling.competing_risks import ExecutionCompetingRisksLabeler
 from .features.base import BaseLOBTransform
 from .features.representation import RepresentationTransform
 from .features.compose import ToxicityFeatures, ComposeTransforms
+
+
+def _prepare_output_path(path: str) -> str:
+    """Return a normalized absolute output path and ensure its parent exists."""
+    output_path = Path(path).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return str(output_path.resolve())
 
 
 def _market_is_empty(market: Market) -> bool:
@@ -273,17 +281,12 @@ def _chunk_worker(kwargs: dict) -> dict:
 
     tracker_kwargs = kwargs.pop("tracker_kwargs")
     file_path = kwargs.pop("file_path")
-    output_parquet = kwargs.pop("output_parquet")
+    output_parquet = _prepare_output_path(kwargs.pop("output_parquet"))
     chunk_ts_start: Optional[int] = kwargs.pop("chunk_ts_start", None)
     chunk_ts_end: Optional[int] = kwargs.pop("chunk_ts_end", None)
     chunk_idx: int = kwargs.pop("chunk_idx", 0)
     # Remaining keys forwarded to process_stream
     process_kwargs = kwargs
-
-    # Ensure output directory exists in worker process
-    import os
-
-    os.makedirs(os.path.dirname(output_parquet), exist_ok=True)
 
     tracker = OrderTracker(**tracker_kwargs)
     tracker.process_stream(
@@ -572,6 +575,7 @@ class OrderTracker:
         self, out_buffer, parquet_writer, output_parquet, parquet_batch_size, order
     ):
         """Serialize, label, append, and maybe flush one completed order."""
+        self._enforce_time_censor_horizon(order)
         record = order.to_dict()
         record = self._apply_labeling(record)
         out_buffer.append(record)
@@ -579,6 +583,25 @@ class OrderTracker:
             out_buffer, parquet_writer, output_parquet, parquet_batch_size
         )
         return out_buffer, parquet_writer
+
+    def _enforce_time_censor_horizon(self, order: TrackedOrder) -> bool:
+        """
+        Clamp completed order lifetime to the configured time-censor horizon.
+
+        Returns:
+            True if the order was clipped to the horizon, otherwise False.
+        """
+        end_time = getattr(order, "end_time", 0)
+        if end_time <= 0:
+            return False
+
+        censor_deadline = order.entry_time + self.time_censor_ns
+        if end_time <= censor_deadline:
+            return False
+
+        order.end_time = censor_deadline
+        order.status = "CENSORED_TIME"
+        return True
 
     def _maybe_flush(
         self, out_buffer, parquet_writer, output_parquet, parquet_batch_size
@@ -596,6 +619,7 @@ class OrderTracker:
             Tuple of (out_buffer, parquet_writer) after potential flush.
         """
         if len(out_buffer) >= parquet_batch_size:
+            output_parquet = _prepare_output_path(output_parquet)
             table = pa.Table.from_pylist(out_buffer)
             if parquet_writer is None:
                 parquet_writer = pq.ParquetWriter(output_parquet, table.schema)
@@ -642,11 +666,22 @@ class OrderTracker:
         for v in self.active_virtual:
             v.update(mbo, book, self.market)
             if v.is_active() and (mbo.ts_event - v.entry_time > self.time_censor_ns):
-                v.on_censor("CENSORED_TIME", mbo)
+                v.on_censor("CENSORED_TIME")
+                v.end_time = v.entry_time + self.time_censor_ns
             if v.is_active():
                 next_active_virtual.append(v)
             elif v.status == "FILLED":
-                self.post_trade_virtual.append(v)
+                clipped = self._enforce_time_censor_horizon(v)
+                if clipped:
+                    out_buffer, parquet_writer = self._append_completed_order(
+                        out_buffer,
+                        parquet_writer,
+                        output_parquet,
+                        parquet_batch_size,
+                        v,
+                    )
+                else:
+                    self.post_trade_virtual.append(v)
             else:
                 out_buffer, parquet_writer = self._append_completed_order(
                     out_buffer,
@@ -871,6 +906,7 @@ class OrderTracker:
                 single-stream use.
             tqdm_desc: Label shown to the left of the progress bar.
         """
+        output_parquet = _prepare_output_path(output_parquet)
         data = db.DBNStore.from_file(file_path)
         count = 0
         last_ts = 0
@@ -1110,6 +1146,7 @@ class OrderTracker:
             )
 
         if out_buffer:
+            output_parquet = _prepare_output_path(output_parquet)
             table = pa.Table.from_pylist(out_buffer)
             if parquet_writer is None:
                 parquet_writer = pq.ParquetWriter(output_parquet, table.schema)
@@ -1283,13 +1320,19 @@ class OrderTracker:
         )
 
         # Build per-worker kwargs
-        Path(output_parquet).parent.mkdir(parents=True, exist_ok=True)
-        temp_dir = tempfile.mkdtemp(prefix="lob_parallel_")
+        output_parquet = _prepare_output_path(output_parquet)
+        temp_root = Path(output_parquet).parent / ".lob_parallel_tmp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        temp_dir = tempfile.mkdtemp(
+            prefix=f"lob_parallel_{uuid4().hex}_",
+            dir=str(temp_root),
+        )
+        temp_dir = str(Path(temp_dir).resolve())
         temp_files: List[str] = []
         worker_args: List[dict] = []
 
         for i, (ts_start, ts_end) in enumerate(chunks):
-            tmp = os.path.join(temp_dir, f"chunk_{i:03d}.parquet")
+            tmp = _prepare_output_path(os.path.join(temp_dir, f"chunk_{i:03d}.parquet"))
             temp_files.append(tmp)
 
             # Calculate per-chunk total (not cumulative)
@@ -1372,6 +1415,7 @@ class OrderTracker:
                 pass
         try:
             os.rmdir(temp_dir)
+            temp_root.rmdir()
         except OSError:
             pass
 

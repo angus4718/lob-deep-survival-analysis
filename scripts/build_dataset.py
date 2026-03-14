@@ -16,7 +16,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.order_tracking import (
     OrderTracker,
     analyze_empty_market_splits,
-    count_messages_between_split_points,
 )
 from src.config import CONFIG
 
@@ -35,7 +34,7 @@ TARGET_DAY = None  # e.g. "2025-12-01"
 
 # Set the number of parallel worker processes,
 # or None to auto-select based on available CPU cores (leaving 2 cores free).
-N_WORKERS = None
+N_WORKERS = 2
 
 FILE_NAME = (
     f"XNAS_ITCH_{SYMBOL}_mbo_{START_DATE.replace('-', '')}_{END_DATE.replace('-', '')}"
@@ -62,29 +61,6 @@ def _load_or_build_split_cache(cache_path: Path, dbn_file: Path) -> dict:
                 f"{cached['total_messages']:,} total messages"
             )
             return cached
-
-        if isinstance(cached, list):
-            print(
-                "[cache] Legacy split-point cache detected. "
-                "Computing message counts and upgrading cache format..."
-            )
-            split_points = cached
-            counts, total_messages = count_messages_between_split_points(
-                file_path=str(dbn_file),
-                split_points=split_points,
-                verbose=True,
-            )
-            upgraded = {
-                "version": 2,
-                "split_points": split_points,
-                "messages_between_splits": counts,
-                "total_messages": total_messages,
-            }
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(cache_path, "w") as f:
-                json.dump(upgraded, f)
-            print(f"[cache] Upgraded cache written to {cache_path}")
-            return upgraded
 
         print("[cache] Cache format not recognized. Rebuilding split metadata...")
 
