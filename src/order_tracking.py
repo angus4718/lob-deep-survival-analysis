@@ -505,6 +505,7 @@ class OrderTracker:
         self,
         samples_per_day: int = 100,
         time_censor_s: float = CONFIG.time_binning.max_time_s,
+        random_seed: Optional[int] = CONFIG.random_seed,
         labeler: Optional[BaseLabeler] = None,
         representation_transform: Optional[BaseLOBTransform] = None,
         include_representation: bool = True,
@@ -520,6 +521,8 @@ class OrderTracker:
         self.virtual_oid_counter = 0
 
         self.time_censor_ns = int(time_censor_s * 1e9)
+        self.random_seed = random_seed
+        self._rng = random.Random(random_seed)
 
         self.samples_per_day = samples_per_day
         self.virtual_sample_schedule: Dict[int, List[int]] = {}
@@ -549,6 +552,7 @@ class OrderTracker:
         self._init_kwargs = dict(
             samples_per_day=samples_per_day,
             time_censor_s=time_censor_s,
+            random_seed=random_seed,
             include_representation=include_representation,
             lookback_period=lookback_period,
             snapshot_bin_s=_bin_s,
@@ -642,7 +646,7 @@ class OrderTracker:
         virtual_target = self.samples_per_day
         v_count = max(1, (virtual_target + 1) // 2)
         v_times = sorted(
-            int(random.uniform(day_start_ns, day_end_ns)) for _ in range(v_count)
+            int(self._rng.uniform(day_start_ns, day_end_ns)) for _ in range(v_count)
         )
         self.virtual_sample_schedule[day] = v_times
         self.virtual_sample_index[day] = 0
@@ -1413,12 +1417,14 @@ class OrderTracker:
             else:
                 chunk_total = _per_chunk_total(ts_end)
 
+            worker_tracker_kwargs = dict(self._init_kwargs)
+            if self.random_seed is not None:
+                worker_tracker_kwargs["random_seed"] = self.random_seed + i
+
             worker_args.append(
                 dict(
                     _project_root=_PROJECT_ROOT,
-                    tracker_kwargs=dict(
-                        self._init_kwargs
-                    ),  # shallow copy of primitives
+                    tracker_kwargs=worker_tracker_kwargs,
                     file_path=file_path,
                     output_parquet=tmp,
                     chunk_ts_start=ts_start,
