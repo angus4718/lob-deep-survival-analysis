@@ -434,9 +434,11 @@ class VirtualOrder(TrackedOrder):
     best_ask_at_post_trade: int = None
     post_trade_deadline_ts: Optional[int] = None
     entry_representation: Optional[List] = None  # (T_hist, 2W+1), no padding
-    toxicity_representation: Optional[List] = None  # (T_hist, 18), no padding
+    toxicity_representation: Optional[List] = None  # (T_hist, toxicity_dim), no padding
     lob_sequence: List[List[float]] = field(default_factory=list)  # (T_var, 2W+1)
-    toxicity_sequence: List[List[float]] = field(default_factory=list)  # (T_var, 18)
+    toxicity_sequence: List[List[float]] = field(
+        default_factory=list
+    )  # (T_var, toxicity_dim)
 
     def __post_init__(self):
         self.order_type = "VIRTUAL"
@@ -841,7 +843,12 @@ class OrderTracker:
             if lob_step is not None:
                 v.lob_sequence.append(list(lob_step))
             if tox_step is not None:
-                v.toxicity_sequence.append(list(tox_step))
+                v.toxicity_sequence.append(
+                    self.toxicity_features.augment_row_with_queue_position(
+                        tox_step,
+                        v.current_vahead,
+                    )
+                )
 
     def _spawn_virtuals_for_pending(self, day, book, best_bid, best_ask):
         """
@@ -859,7 +866,6 @@ class OrderTracker:
             )
 
             initial_lob_sequence = [list(row) for row in entry_representation]
-            initial_tox_sequence = [list(row) for row in toxicity_representation]
 
             bid_level_orders = book.bids.get(best_bid.price)
             if not bid_level_orders:
@@ -881,6 +887,13 @@ class OrderTracker:
                 ids_ahead = {}
                 current_vahead = getattr(best_bid, "size", 0) if best_bid else 0
 
+            bid_toxicity_representation = (
+                self.toxicity_features.augment_rows_with_queue_position(
+                    toxicity_representation,
+                    current_vahead,
+                )
+            )
+
             v = VirtualOrder(
                 internal_id=self.virtual_oid_counter,
                 entry_time=scheduled_ts,
@@ -891,9 +904,9 @@ class OrderTracker:
                 best_bid_at_entry=best_bid.price if best_bid else None,
                 best_ask_at_entry=best_ask.price if best_ask else None,
                 entry_representation=entry_representation,
-                toxicity_representation=toxicity_representation,
+                toxicity_representation=bid_toxicity_representation,
                 lob_sequence=[list(row) for row in initial_lob_sequence],
-                toxicity_sequence=[list(row) for row in initial_tox_sequence],
+                toxicity_sequence=[list(row) for row in bid_toxicity_representation],
             )
             self.active_virtual.append(v)
             self.virtual_oid_counter += 1
@@ -919,6 +932,13 @@ class OrderTracker:
                 ids_ahead = {}
                 current_vahead = getattr(best_ask, "size", 0) if best_ask else 0
 
+            ask_toxicity_representation = (
+                self.toxicity_features.augment_rows_with_queue_position(
+                    toxicity_representation,
+                    current_vahead,
+                )
+            )
+
             v = VirtualOrder(
                 internal_id=self.virtual_oid_counter,
                 entry_time=scheduled_ts,
@@ -929,9 +949,9 @@ class OrderTracker:
                 best_bid_at_entry=best_bid.price if best_bid else None,
                 best_ask_at_entry=best_ask.price if best_ask else None,
                 entry_representation=entry_representation,
-                toxicity_representation=toxicity_representation,
+                toxicity_representation=ask_toxicity_representation,
                 lob_sequence=[list(row) for row in initial_lob_sequence],
-                toxicity_sequence=[list(row) for row in initial_tox_sequence],
+                toxicity_sequence=[list(row) for row in ask_toxicity_representation],
             )
             self.active_virtual.append(v)
             self.virtual_oid_counter += 1

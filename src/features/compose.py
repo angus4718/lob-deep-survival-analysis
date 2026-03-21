@@ -54,6 +54,35 @@ class ToxicityFeatures(BaseLOBTransform):
 
     n_levels: int = 5  # Number of price levels to consider
 
+    @staticmethod
+    def queue_position_feature(current_vahead: Any) -> float:
+        """Convert queue-ahead volume into a non-negative scalar feature."""
+        try:
+            return float(max(int(current_vahead), 0))
+        except Exception:
+            return 0.0
+
+    def augment_row_with_queue_position(
+        self,
+        toxicity_row: Sequence[float],
+        current_vahead: Any,
+    ) -> List[float]:
+        """Append queue-position to one toxicity feature row."""
+        return list(toxicity_row) + [self.queue_position_feature(current_vahead)]
+
+    def augment_rows_with_queue_position(
+        self,
+        toxicity_rows: Sequence[Sequence[float]],
+        current_vahead: Any,
+    ) -> List[List[float]]:
+        """Append queue-position to each row in a toxicity feature sequence."""
+        if not toxicity_rows:
+            return []
+        return [
+            self.augment_row_with_queue_position(row, current_vahead)
+            for row in toxicity_rows
+        ]
+
     def transform_snapshot(self, lob_state: Book) -> torch.Tensor:
         """Extract toxicity-predictive features from a single LOB snapshot."""
         features = []
