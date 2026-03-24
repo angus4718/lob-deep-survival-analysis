@@ -499,14 +499,15 @@ class OrderTracker:
 
     Args:
         samples_per_day: Target number of samples per trading day.
-        time_censor_s: Maximum lifetime in seconds before an active order is
-            censored as CENSORED_TIME.
+        time_censor_s: Optional maximum lifetime in seconds before an active
+            order is censored as CENSORED_TIME. If None, no time censor is
+            applied.
     """
 
     def __init__(
         self,
         samples_per_day: int = 100,
-        time_censor_s: float = CONFIG.time_binning.max_time_s,
+        time_censor_s: Optional[float] = None,
         random_seed: Optional[int] = CONFIG.random_seed,
         labeler: Optional[BaseLabeler] = None,
         representation_transform: Optional[BaseLOBTransform] = None,
@@ -522,7 +523,9 @@ class OrderTracker:
         self.last_sample_time = 0
         self.virtual_oid_counter = 0
 
-        self.time_censor_ns = int(time_censor_s * 1e9)
+        self.time_censor_ns: Optional[int] = (
+            int(time_censor_s * 1e9) if time_censor_s is not None else None
+        )
         self.random_seed = random_seed
         self._rng = random.Random(random_seed)
 
@@ -605,6 +608,8 @@ class OrderTracker:
         end_time = getattr(order, "end_time", 0)
         if end_time <= 0:
             return False
+        if self.time_censor_ns is None:
+            return False
 
         censor_deadline = order.entry_time + self.time_censor_ns
         if end_time <= censor_deadline:
@@ -676,7 +681,11 @@ class OrderTracker:
         next_active_virtual = []
         for v in self.active_virtual:
             v.update(mbo, book, self.market)
-            if v.is_active() and (mbo.ts_event - v.entry_time > self.time_censor_ns):
+            if (
+                self.time_censor_ns is not None
+                and v.is_active()
+                and (mbo.ts_event - v.entry_time > self.time_censor_ns)
+            ):
                 v.on_censor("CENSORED_TIME")
                 v.end_time = v.entry_time + self.time_censor_ns
             if v.is_active():
@@ -707,6 +716,7 @@ class OrderTracker:
     def _close_open_orders_for_day_end(
         self,
         day_end_ts: int,
+        day: int,
         book,
         out_buffer,
         parquet_writer,
@@ -742,6 +752,32 @@ class OrderTracker:
                     v,
                 )
             self.post_trade_virtual = []
+
+        # Process any pending virtual orders that were scheduled but never spawned
+        # (e.g., scheduled after the last MBO message of the day).
+        # Spawn them at day_end_ts and immediately censor them.
+        pending_v = self.pending_virtual.get(day, [])
+        if pending_v and book is not None:
+            best_bid, best_ask = book.bbo()
+            if best_bid and best_ask:
+                # Use the same spawn logic to create orders with valid entry features
+                self._spawn_virtuals_for_pending(day, book, best_bid, best_ask)
+                # Now censor all newly-spawned actives at day end
+                for v in self.active_virtual:
+                    if v.is_active():
+                        v.on_censor("CENSORED_END")
+                        v.end_time = day_end_ts
+                    out_buffer, parquet_writer = self._append_completed_order(
+                        out_buffer,
+                        parquet_writer,
+                        output_parquet,
+                        parquet_batch_size,
+                        v,
+                    )
+                self.active_virtual = []
+        elif pending_v:
+            # If book state is unavailable at day end, mark pending orders as failed to spawn
+            self.pending_virtual[day] = []
 
         return out_buffer, parquet_writer
 
@@ -1101,6 +1137,7 @@ class OrderTracker:
                                 .value
                             )
                         ),
+                        day=current_local_date,
                         book=None,
                         out_buffer=out_buffer,
                         parquet_writer=parquet_writer,
@@ -1130,6 +1167,7 @@ class OrderTracker:
                         pass
                     out_buffer, parquet_writer = self._close_open_orders_for_day_end(
                         day_end_ts=day_end_ns,
+                        day=current_local_date,
                         book=day_end_book,
                         out_buffer=out_buffer,
                         parquet_writer=parquet_writer,
