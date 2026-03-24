@@ -20,12 +20,14 @@ from src.order_tracking import (
 from src.config import CONFIG
 
 SYMBOL = "AAPL"
-START_DATE = "2025-12-01"
-END_DATE = "2026-01-01"
+START_DATE = "2025-11-01"
+END_DATE = "2025-12-01"
 
 SAMPLES_PER_DAY = 1000
-TIME_CENSOR_S = CONFIG.time_binning.max_time_s
+# Keep long-lived orders for dynamic models; disable fixed time censoring.
+TIME_CENSOR_S = None
 LOOKBACK_PERIOD = 20
+RANDOM_SEED = CONFIG.random_seed
 PROGRESS_INTERVAL = 100_000
 
 # Set to a "YYYY-MM-DD" string to restrict processing to a single trading day,
@@ -34,7 +36,7 @@ TARGET_DAY = None  # e.g. "2025-12-01"
 
 # Set the number of parallel worker processes,
 # or None to auto-select based on available CPU cores (leaving 2 cores free).
-N_WORKERS = 2
+N_WORKERS = None
 
 FILE_NAME = (
     f"XNAS_ITCH_{SYMBOL}_mbo_{START_DATE.replace('-', '')}_{END_DATE.replace('-', '')}"
@@ -97,6 +99,7 @@ def main() -> None:
         samples_per_day=SAMPLES_PER_DAY,
         time_censor_s=TIME_CENSOR_S,
         lookback_period=LOOKBACK_PERIOD,
+        random_seed=RANDOM_SEED,
     )
 
     if N_WORKERS > 1:

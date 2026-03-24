@@ -43,6 +43,7 @@ class TimeBinningConfig:
 
 @dataclass(frozen=True)
 class ProjectConfig:
+    random_seed: int = 4718
     data: DataConfig = DataConfig()
     features: FeatureConfig = FeatureConfig()
     labeling: LabelingConfig = LabelingConfig()

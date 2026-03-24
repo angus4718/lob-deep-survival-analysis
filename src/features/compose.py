@@ -54,6 +54,35 @@ class ToxicityFeatures(BaseLOBTransform):
 
     n_levels: int = 5  # Number of price levels to consider
 
+    @staticmethod
+    def queue_position_feature(current_vahead: Any) -> float:
+        """Convert queue-ahead volume into a non-negative scalar feature."""
+        try:
+            return float(max(int(current_vahead), 0))
+        except Exception:
+            return 0.0
+
+    def augment_row_with_queue_position(
+        self,
+        toxicity_row: Sequence[float],
+        current_vahead: Any,
+    ) -> List[float]:
+        """Append queue-position to one toxicity feature row."""
+        return list(toxicity_row) + [self.queue_position_feature(current_vahead)]
+
+    def augment_rows_with_queue_position(
+        self,
+        toxicity_rows: Sequence[Sequence[float]],
+        current_vahead: Any,
+    ) -> List[List[float]]:
+        """Append queue-position to each row in a toxicity feature sequence."""
+        if not toxicity_rows:
+            return []
+        return [
+            self.augment_row_with_queue_position(row, current_vahead)
+            for row in toxicity_rows
+        ]
+
     def transform_snapshot(self, lob_state: Book) -> torch.Tensor:
         """Extract toxicity-predictive features from a single LOB snapshot."""
         features = []
@@ -345,8 +374,9 @@ class ToxicityFeatures(BaseLOBTransform):
         self,
         snapshots: Sequence[tuple],
         n_lookback: int,
+        pad_to_length: bool = True,
     ) -> torch.Tensor:
-        """Convert sequence of (bids_dict, asks_dict) tuples into (n_lookback, 18) tensor.
+        """Convert bid/ask snapshots into toxicity feature time series.
 
         Computes 18 toxicity metrics for each snapshot in the lookback window,
         producing a time series where each feature evolves over the lookback period.
@@ -362,11 +392,16 @@ class ToxicityFeatures(BaseLOBTransform):
             - Each row is one snapshot in the lookback period
             - Each column is one of 18 toxicity metrics
             - All features are raw (unscaled) values
+
+            If ``pad_to_length=False``, returns shape ``(T, 18)`` where ``T``
+            is the number of available snapshots.
         """
         feature_dim = self._feature_dim()
 
         if not snapshots:
-            return torch.zeros((n_lookback, feature_dim), dtype=torch.float32)
+            if pad_to_length:
+                return torch.zeros((n_lookback, feature_dim), dtype=torch.float32)
+            return torch.zeros((0, feature_dim), dtype=torch.float32)
 
         # Extract features for each snapshot
         features_list = []
@@ -378,7 +413,13 @@ class ToxicityFeatures(BaseLOBTransform):
         if features_list:
             result = torch.stack(features_list, dim=0)
         else:
-            result = torch.zeros((0, feature_dim), dtype=torch.float32)
+            if pad_to_length:
+                result = torch.zeros((n_lookback, feature_dim), dtype=torch.float32)
+            else:
+                result = torch.zeros((0, feature_dim), dtype=torch.float32)
+
+        if not pad_to_length:
+            return result
 
         # Pad or truncate to exactly n_lookback timesteps
         T = result.shape[0]

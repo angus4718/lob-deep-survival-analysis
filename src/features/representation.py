@@ -54,13 +54,15 @@ class RepresentationTransform(BaseLOBTransform):
         self,
         snapshots: Sequence[tuple],
         n_lookback: int,
+        pad_to_length: bool = True,
     ) -> torch.Tensor:
-        """Convert a sequence of (bids_dict, asks_dict) tuples into a (n_lookback, 2W+1) tensor.
+        """Convert bid/ask snapshots into a tensor on a common centered price grid.
 
         Uses the most recent snapshot's mid-price as the common center for all
-        time steps.  If fewer than ``n_lookback`` snapshots are available the
-        result is zero-padded at the beginning so the output always has shape
-        ``(n_lookback, 2W+1)``.
+        time steps. By default, if fewer than ``n_lookback`` snapshots are
+        available the result is zero-padded at the beginning so the output has
+        shape ``(n_lookback, 2W+1)``. When ``pad_to_length`` is False, the
+        method returns only the available snapshots without padding/truncation.
 
         Args:
             snapshots: Sequence of ``(bids, asks)`` dicts where keys are integer
@@ -68,15 +70,21 @@ class RepresentationTransform(BaseLOBTransform):
             n_lookback: Required number of time steps in the output.
 
         Returns:
-            Float tensor of shape ``(n_lookback, 2W+1)``.
+            Float tensor of shape ``(n_lookback, 2W+1)`` when
+            ``pad_to_length=True``; otherwise ``(T, 2W+1)`` where ``T`` is the
+            number of available snapshots.
         """
         width = 2 * self.window + 1
         if not snapshots:
-            return torch.zeros((n_lookback, width), dtype=torch.float32)
+            if pad_to_length:
+                return torch.zeros((n_lookback, width), dtype=torch.float32)
+            return torch.zeros((0, width), dtype=torch.float32)
 
         bids_last, asks_last = snapshots[-1]
         if not bids_last or not asks_last:
-            return torch.zeros((n_lookback, width), dtype=torch.float32)
+            if pad_to_length:
+                return torch.zeros((n_lookback, width), dtype=torch.float32)
+            return torch.zeros((0, width), dtype=torch.float32)
 
         best_bid = max(bids_last.keys())
         best_ask = min(asks_last.keys())
@@ -95,10 +103,15 @@ class RepresentationTransform(BaseLOBTransform):
 
         tensor = torch.stack(features, dim=0)
 
+        if not pad_to_length:
+            return tensor
+
         # Pad with zeros at the start when the buffer is not yet full
         if len(features) < n_lookback:
             pad = torch.zeros((n_lookback - len(features), width), dtype=torch.float32)
             tensor = torch.cat([pad, tensor], dim=0)
+        elif len(features) > n_lookback:
+            tensor = tensor[-n_lookback:, :]
 
         return tensor
 
