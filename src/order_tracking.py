@@ -405,13 +405,43 @@ class TrackedOrder:
             base["best_ask_at_post_trade"] = getattr(
                 self, "best_ask_at_post_trade", None
             )
-            base["entry_representation"] = getattr(self, "entry_representation", None)
+
+            # Three LOB representation modes
+            base["entry_representation_market_depth"] = getattr(
+                self, "entry_representation_market_depth", None
+            )
+            base["entry_representation_moving_window"] = getattr(
+                self, "entry_representation_moving_window", None
+            )
+            base["entry_representation_raw_top5"] = getattr(
+                self, "entry_representation_raw_top5", None
+            )
+
+            # Toxicity representation (shared across all modes)
             base["toxicity_representation"] = getattr(
                 self, "toxicity_representation", None
             )
-            base["lob_sequence"] = getattr(self, "lob_sequence", None)
+
+            # LOB sequences for all three modes
+            base["lob_sequence_market_depth"] = getattr(
+                self, "lob_sequence_market_depth", None
+            )
+            base["lob_sequence_moving_window"] = getattr(
+                self, "lob_sequence_moving_window", None
+            )
+            base["lob_sequence_raw_top5"] = getattr(self, "lob_sequence_raw_top5", None)
+
+            # Toxicity sequence
             base["toxicity_sequence"] = getattr(self, "toxicity_sequence", None)
-            base["sequence_length"] = len(getattr(self, "lob_sequence", []) or [])
+
+            # Legacy fields (kept for backward compatibility)
+            base["entry_representation"] = getattr(
+                self, "entry_representation_moving_window", None
+            )
+            base["lob_sequence"] = getattr(self, "lob_sequence_moving_window", None)
+            base["sequence_length"] = len(
+                getattr(self, "lob_sequence_moving_window", []) or []
+            )
 
         return base
 
@@ -433,9 +463,30 @@ class VirtualOrder(TrackedOrder):
     best_bid_at_post_trade: int = None
     best_ask_at_post_trade: int = None
     post_trade_deadline_ts: Optional[int] = None
-    entry_representation: Optional[List] = None  # (T_hist, 2W+1), no padding
+
+    # Market-depth representation (41 dims)
+    entry_representation_market_depth: Optional[List] = None  # (T_hist, 41)
+    lob_sequence_market_depth: List[List[float]] = field(
+        default_factory=list
+    )  # (T_var, 41)
+
+    # Moving-window representation (41 dims)
+    entry_representation_moving_window: Optional[List] = None  # (T_hist, 41)
+    lob_sequence_moving_window: List[List[float]] = field(
+        default_factory=list
+    )  # (T_var, 41)
+
+    # Raw top-5 representation (20 dims: 5 bid levels * 2 + 5 ask levels * 2)
+    entry_representation_raw_top5: Optional[List] = None  # (T_hist, 20)
+    lob_sequence_raw_top5: List[List[float]] = field(
+        default_factory=list
+    )  # (T_var, 20)
+
+    # Toxicity representation (consistent across all modes)
     toxicity_representation: Optional[List] = None  # (T_hist, toxicity_dim), no padding
-    lob_sequence: List[List[float]] = field(default_factory=list)  # (T_var, 2W+1)
+    lob_sequence: List[List[float]] = field(
+        default_factory=list
+    )  # (T_var, 2W+1) - deprecated, kept for backward compat
     toxicity_sequence: List[List[float]] = field(
         default_factory=list
     )  # (T_var, toxicity_dim)
@@ -535,9 +586,21 @@ class OrderTracker:
         self.pending_virtual: Dict[int, List[int]] = {}
 
         self.labeler = labeler or ExecutionCompetingRisksLabeler()
+
+        # Create three separate representation transforms for all modes
         self.representation_transform = (
             representation_transform or RepresentationTransform()
         )
+        self.representation_transform_market_depth = RepresentationTransform(
+            representation="market_depth"
+        )
+        self.representation_transform_moving_window = RepresentationTransform(
+            representation="moving_window"
+        )
+        self.representation_transform_raw_top5 = RepresentationTransform(
+            representation="raw_top5"
+        )
+
         self.toxicity_features = ToxicityFeatures()
         self.include_representation = include_representation
 
@@ -806,25 +869,60 @@ class OrderTracker:
 
     def _get_entry_feature_sequences(
         self,
-    ) -> tuple[List[List[float]], List[List[float]]]:
-        """Build variable-length historical sequences from the snapshot buffer."""
-        if not self.include_representation or self.representation_transform is None:
-            return [], []
+    ) -> tuple[
+        List[List[float]],
+        List[List[float]],
+        List[List[float]],
+        List[List[float]],
+        List[List[float]],
+    ]:
+        """Build variable-length historical sequences from the snapshot buffer for all modes.
+
+        Returns:
+            Tuple of (entry_market_depth, entry_moving_window, entry_raw_top5,
+                     toxicity_representation, unused_legacy)
+        """
+        if not self.include_representation:
+            return [], [], [], [], []
 
         buf = list(self._lob_snapshot_buffer)
         if not buf:
-            return [], []
+            return [], [], [], [], []
 
-        entry_representation: List[List[float]] = []
+        entry_market_depth: List[List[float]] = []
+        entry_moving_window: List[List[float]] = []
+        entry_raw_top5: List[List[float]] = []
         toxicity_representation: List[List[float]] = []
-        try:
-            entry_tensor = self.representation_transform.transform_sequence_from_dicts(
-                buf,
-                self.lookback_period,
-                pad_to_length=False,
-            )
-            entry_representation = entry_tensor.tolist()
 
+        try:
+            # Market depth representation
+            if self.representation_transform_market_depth is not None:
+                md_tensor = self.representation_transform_market_depth.transform_sequence_from_dicts(
+                    buf,
+                    self.lookback_period,
+                    pad_to_length=False,
+                )
+                entry_market_depth = md_tensor.tolist()
+
+            # Moving window representation
+            if self.representation_transform_moving_window is not None:
+                mw_tensor = self.representation_transform_moving_window.transform_sequence_from_dicts(
+                    buf,
+                    self.lookback_period,
+                    pad_to_length=False,
+                )
+                entry_moving_window = mw_tensor.tolist()
+
+            # Raw top-5 representation
+            if self.representation_transform_raw_top5 is not None:
+                rt_tensor = self.representation_transform_raw_top5.transform_sequence_from_dicts(
+                    buf,
+                    self.lookback_period,
+                    pad_to_length=False,
+                )
+                entry_raw_top5 = rt_tensor.tolist()
+
+            # Toxicity representation (shared across all modes)
             if self.toxicity_features is not None:
                 tox_tensor = self.toxicity_features.transform_sequence_from_dicts(
                     buf,
@@ -832,37 +930,71 @@ class OrderTracker:
                     pad_to_length=False,
                 )
                 toxicity_representation = tox_tensor.tolist()
-        except Exception:
-            return [], []
 
-        return entry_representation, toxicity_representation
+        except Exception:
+            pass
+
+        return (
+            entry_market_depth,
+            entry_moving_window,
+            entry_raw_top5,
+            toxicity_representation,
+            [],
+        )
 
     def _append_snapshot_to_active_virtuals(
         self, bids_snap: Dict[int, int], asks_snap: Dict[int, int]
     ) -> None:
-        """Append one feature step to active orders so sequence length follows wait time."""
-        if (
-            not self.active_virtual
-            or not self.include_representation
-            or self.representation_transform is None
-        ):
+        """Append one feature step to active orders for all representation modes."""
+        if not self.active_virtual or not self.include_representation:
             return
 
-        lob_step: Optional[List[float]] = None
+        lob_md_step: Optional[List[float]] = None  # market depth
+        lob_mw_step: Optional[List[float]] = None  # moving window
+        lob_rt_step: Optional[List[float]] = None  # raw top5
         tox_step: Optional[List[float]] = None
         snapshot = [(bids_snap, asks_snap)]
 
+        # Market depth
         try:
-            lob_tensor = self.representation_transform.transform_sequence_from_dicts(
-                snapshot,
-                n_lookback=1,
-                pad_to_length=False,
-            )
-            if lob_tensor.shape[0] > 0:
-                lob_step = lob_tensor[-1].tolist()
+            if self.representation_transform_market_depth is not None:
+                md_tensor = self.representation_transform_market_depth.transform_sequence_from_dicts(
+                    snapshot,
+                    n_lookback=1,
+                    pad_to_length=False,
+                )
+                if md_tensor.shape[0] > 0:
+                    lob_md_step = md_tensor[-1].tolist()
         except Exception:
-            lob_step = None
+            lob_md_step = None
 
+        # Moving window
+        try:
+            if self.representation_transform_moving_window is not None:
+                mw_tensor = self.representation_transform_moving_window.transform_sequence_from_dicts(
+                    snapshot,
+                    n_lookback=1,
+                    pad_to_length=False,
+                )
+                if mw_tensor.shape[0] > 0:
+                    lob_mw_step = mw_tensor[-1].tolist()
+        except Exception:
+            lob_mw_step = None
+
+        # Raw top-5
+        try:
+            if self.representation_transform_raw_top5 is not None:
+                rt_tensor = self.representation_transform_raw_top5.transform_sequence_from_dicts(
+                    snapshot,
+                    n_lookback=1,
+                    pad_to_length=False,
+                )
+                if rt_tensor.shape[0] > 0:
+                    lob_rt_step = rt_tensor[-1].tolist()
+        except Exception:
+            lob_rt_step = None
+
+        # Toxicity
         if self.toxicity_features is not None:
             try:
                 tox_tensor = self.toxicity_features.transform_sequence_from_dicts(
@@ -876,8 +1008,12 @@ class OrderTracker:
                 tox_step = None
 
         for v in self.active_virtual:
-            if lob_step is not None:
-                v.lob_sequence.append(list(lob_step))
+            if lob_md_step is not None:
+                v.lob_sequence_market_depth.append(list(lob_md_step))
+            if lob_mw_step is not None:
+                v.lob_sequence_moving_window.append(list(lob_mw_step))
+            if lob_rt_step is not None:
+                v.lob_sequence_raw_top5.append(list(lob_rt_step))
             if tox_step is not None:
                 v.toxicity_sequence.append(
                     self.toxicity_features.augment_row_with_queue_position(
@@ -897,11 +1033,13 @@ class OrderTracker:
         pending_v = self.pending_virtual.get(day, [])
         while pending_v:
             scheduled_ts = pending_v.pop(0)
-            entry_representation, toxicity_representation = (
-                self._get_entry_feature_sequences()
-            )
-
-            initial_lob_sequence = [list(row) for row in entry_representation]
+            (
+                entry_market_depth,
+                entry_moving_window,
+                entry_raw_top5,
+                toxicity_representation,
+                _,
+            ) = self._get_entry_feature_sequences()
 
             bid_level_orders = book.bids.get(best_bid.price)
             if not bid_level_orders:
@@ -939,9 +1077,14 @@ class OrderTracker:
                 ids_ahead=ids_ahead,
                 best_bid_at_entry=best_bid.price if best_bid else None,
                 best_ask_at_entry=best_ask.price if best_ask else None,
-                entry_representation=entry_representation,
+                entry_representation_market_depth=entry_market_depth,
+                entry_representation_moving_window=entry_moving_window,
+                entry_representation_raw_top5=entry_raw_top5,
                 toxicity_representation=bid_toxicity_representation,
-                lob_sequence=[list(row) for row in initial_lob_sequence],
+                lob_sequence_market_depth=[list(row) for row in entry_market_depth],
+                lob_sequence_moving_window=[list(row) for row in entry_moving_window],
+                lob_sequence_raw_top5=[list(row) for row in entry_raw_top5],
+                lob_sequence=[],  # deprecated, kept for backward compat
                 toxicity_sequence=[list(row) for row in bid_toxicity_representation],
             )
             self.active_virtual.append(v)
@@ -984,9 +1127,14 @@ class OrderTracker:
                 ids_ahead=ids_ahead,
                 best_bid_at_entry=best_bid.price if best_bid else None,
                 best_ask_at_entry=best_ask.price if best_ask else None,
-                entry_representation=entry_representation,
+                entry_representation_market_depth=entry_market_depth,
+                entry_representation_moving_window=entry_moving_window,
+                entry_representation_raw_top5=entry_raw_top5,
                 toxicity_representation=ask_toxicity_representation,
-                lob_sequence=[list(row) for row in initial_lob_sequence],
+                lob_sequence_market_depth=[list(row) for row in entry_market_depth],
+                lob_sequence_moving_window=[list(row) for row in entry_moving_window],
+                lob_sequence_raw_top5=[list(row) for row in entry_raw_top5],
+                lob_sequence=[],  # deprecated, kept for backward compat
                 toxicity_sequence=[list(row) for row in ask_toxicity_representation],
             )
             self.active_virtual.append(v)

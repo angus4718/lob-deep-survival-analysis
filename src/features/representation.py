@@ -61,8 +61,9 @@ class RepresentationTransform(BaseLOBTransform):
         Uses the most recent snapshot's mid-price as the common center for all
         time steps. By default, if fewer than ``n_lookback`` snapshots are
         available the result is zero-padded at the beginning so the output has
-        shape ``(n_lookback, 2W+1)``. When ``pad_to_length`` is False, the
-        method returns only the available snapshots without padding/truncation.
+        shape ``(n_lookback, 2W+1)`` or ``(n_lookback, 20)`` for raw_top5.
+        When ``pad_to_length`` is False, the method returns only the available
+        snapshots without padding/truncation.
 
         Args:
             snapshots: Sequence of ``(bids, asks)`` dicts where keys are integer
@@ -70,11 +71,16 @@ class RepresentationTransform(BaseLOBTransform):
             n_lookback: Required number of time steps in the output.
 
         Returns:
-            Float tensor of shape ``(n_lookback, 2W+1)`` when
-            ``pad_to_length=True``; otherwise ``(T, 2W+1)`` where ``T`` is the
-            number of available snapshots.
+            Float tensor of shape ``(n_lookback, 2W+1)`` or ``(n_lookback, 20)``
+            when ``pad_to_length=True``; otherwise ``(T, 2W+1)`` or ``(T, 20)``
+            where ``T`` is the number of available snapshots.
         """
-        width = 2 * self.window + 1
+        # Determine output width based on representation type
+        if self.representation == "raw_top5":
+            width = 20
+        else:
+            width = 2 * self.window + 1
+
         if not snapshots:
             if pad_to_length:
                 return torch.zeros((n_lookback, width), dtype=torch.float32)
@@ -86,10 +92,13 @@ class RepresentationTransform(BaseLOBTransform):
                 return torch.zeros((n_lookback, width), dtype=torch.float32)
             return torch.zeros((0, width), dtype=torch.float32)
 
-        best_bid = max(bids_last.keys())
-        best_ask = min(asks_last.keys())
-        mid = 0.5 * (best_bid + best_ask)
-        center = self._anchor_mid(mid)
+        # For raw_top5, center is not needed
+        center = None
+        if self.representation != "raw_top5":
+            best_bid = max(bids_last.keys())
+            best_ask = min(asks_last.keys())
+            mid = 0.5 * (best_bid + best_ask)
+            center = self._anchor_mid(mid)
 
         features: list[torch.Tensor] = []
         for bids, asks in snapshots:
@@ -97,6 +106,8 @@ class RepresentationTransform(BaseLOBTransform):
                 vals = self._moving_window(bids, asks, center)
             elif self.representation == "market_depth":
                 vals = self._market_depth(bids, asks, center)
+            elif self.representation == "raw_top5":
+                vals = self._raw_top5(bids, asks)
             else:
                 raise ValueError(f"Unknown representation: {self.representation}")
             features.append(torch.tensor(vals, dtype=torch.float32))
@@ -126,12 +137,18 @@ class RepresentationTransform(BaseLOBTransform):
         """Build a representation using a provided center price."""
         bid_levels, ask_levels = self._levels_from_book(lob_state)
         if not bid_levels or not ask_levels:
-            return torch.zeros((2 * self.window + 1,), dtype=torch.float32)
+            # Return appropriately sized zero tensor based on representation type
+            if self.representation == "raw_top5":
+                return torch.zeros((20,), dtype=torch.float32)
+            else:
+                return torch.zeros((2 * self.window + 1,), dtype=torch.float32)
 
         if self.representation == "moving_window":
             values = self._moving_window(bid_levels, ask_levels, center)
         elif self.representation == "market_depth":
             values = self._market_depth(bid_levels, ask_levels, center)
+        elif self.representation == "raw_top5":
+            values = self._raw_top5(bid_levels, ask_levels)
         else:
             raise ValueError(f"Unknown representation: {self.representation}")
 
@@ -192,6 +209,45 @@ class RepresentationTransform(BaseLOBTransform):
             cum_bid += bids.get(bid_price, 0.0)
             values[self.window + step] = self._encode_signed_size(cum_ask)
             values[self.window - step] = self._encode_signed_size(-cum_bid)
+        return values
+
+    def _raw_top5(
+        self,
+        bids: Dict[int, float],
+        asks: Dict[int, float],
+    ) -> list[float]:
+        """Return raw top 5 bid and ask price-volume pairs.
+
+        Returns a 20-feature vector:
+        [bid_price_1, bid_vol_1, ..., bid_price_5, bid_vol_5,
+         ask_price_1, ask_vol_1, ..., ask_price_5, ask_vol_5]
+
+        Missing levels are filled with 0.0 (price and volume).
+        """
+        values: list[float] = []
+
+        # Top 5 bid levels (best to 5th best)
+        bid_prices_sorted = sorted(bids.keys(), reverse=True)[:5]
+        for i in range(5):
+            if i < len(bid_prices_sorted):
+                price = bid_prices_sorted[i]
+                values.append(float(price))
+                values.append(float(bids[price]))
+            else:
+                values.append(0.0)
+                values.append(0.0)
+
+        # Top 5 ask levels (best to 5th best)
+        ask_prices_sorted = sorted(asks.keys())[:5]
+        for i in range(5):
+            if i < len(ask_prices_sorted):
+                price = ask_prices_sorted[i]
+                values.append(float(price))
+                values.append(float(asks[price]))
+            else:
+                values.append(0.0)
+                values.append(0.0)
+
         return values
 
     def _encode_signed_size(self, signed_size: float) -> float:
