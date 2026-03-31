@@ -9,7 +9,7 @@ Consistent with EventType enum in domain/enums.py.
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 from .base import BaseLabeler
 from ..domain.enums import EventType
@@ -48,7 +48,7 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
         else:
             raise ValueError(f"Unknown binning strategy: {self.binning_strategy}")
 
-    def label(self, insertion_context: Dict[str, Any]) -> Dict[str, Any]:
+    def label(self, insertion_context: dict[str, Any]) -> dict[str, Any]:
         """
         Assign event type and time bin for a simulated order.
 
@@ -93,7 +93,7 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
 
     def _classify_fill(
         self, insertion_context: Dict[str, Any]
-    ) -> tuple[EventType, Dict[str, Any]]:
+    ) -> Tuple[EventType, Dict[str, Any]]:
         """
         Classify a FILLED order as FAVORABLE_FILL or TOXIC_FILL.
 

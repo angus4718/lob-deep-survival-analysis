@@ -9,7 +9,7 @@ Implements feature transforms for toxic fill prediction and composition utilitie
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence, List
+from typing import Any, Sequence, List, Dict
 
 import torch
 
@@ -241,7 +241,7 @@ class ToxicityFeatures(BaseLOBTransform):
         return torch.tensor(features, dtype=torch.float32)
 
     def _extract_features_from_dicts(
-        self, bids: dict[int, int], asks: dict[int, int]
+        self, bids: Dict[int, int], asks: Dict[int, int]
     ) -> torch.Tensor:
         """Extract toxicity features from bid/ask dictionaries.
 

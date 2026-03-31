@@ -22,8 +22,9 @@ from uuid import uuid4
 import pandas as pd
 import databento as db
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Callable, Any, Tuple
+from typing import Callable, Any, List, Dict, Optional, Tuple
 import random
+import numpy as np
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -56,7 +57,7 @@ def _market_is_empty(market: Market) -> bool:
     return True
 
 
-def find_empty_market_points(file_path: str, verbose: bool = True) -> List[int]:
+def find_empty_market_points(file_path: str, verbose: bool = True) -> list[int]:
     """
     Scan a DBN file in a single pass and return a sorted list of
     ``ts_event`` values (nanoseconds) at which the aggregated order book
@@ -108,9 +109,9 @@ def find_empty_market_points(file_path: str, verbose: bool = True) -> List[int]:
 
 def count_messages_between_split_points(
     file_path: str,
-    split_points: List[int],
+    split_points: list[int],
     verbose: bool = True,
-) -> Tuple[List[int], int]:
+) -> tuple[list[int], int]:
     """
     Count messages in each segment induced by ``split_points``.
 
@@ -178,7 +179,7 @@ def analyze_empty_market_splits(file_path: str, verbose: bool = True) -> dict:
     }
 
 
-def _select_split_points(empty_points: List[int], n: int) -> List[int]:
+def _select_split_points(empty_points: list[int], n: int) -> list[int]:
     """
     Choose ``n - 1`` timestamps from *empty_points* that divide the
     timeline ``[empty_points[0], empty_points[-1]]`` into *n* roughly
@@ -206,10 +207,10 @@ def _select_split_points(empty_points: List[int], n: int) -> List[int]:
 
 
 def _select_split_points_by_message_count(
-    empty_points: List[int],
-    messages_between_splits: List[int],
+    empty_points: list[int],
+    messages_between_splits: list[int],
     n: int,
-) -> List[int]:
+) -> list[int]:
     """
     Choose ``n - 1`` timestamps from *empty_points* that divide the
     data into *n* chunks with roughly equal message counts, while ensuring
@@ -271,6 +272,8 @@ def _chunk_worker(kwargs: dict) -> dict:
         ``spawned_virtual``.
     """
     import sys
+    import random
+    import numpy as np
 
     project_root = kwargs.pop("_project_root", None)
     if project_root and project_root not in sys.path:
@@ -285,6 +288,13 @@ def _chunk_worker(kwargs: dict) -> dict:
     chunk_ts_start: Optional[int] = kwargs.pop("chunk_ts_start", None)
     chunk_ts_end: Optional[int] = kwargs.pop("chunk_ts_end", None)
     chunk_idx: int = kwargs.pop("chunk_idx", 0)
+
+    # Seed this worker process with its chunk-specific seed
+    chunk_seed = tracker_kwargs.get("random_seed")
+    if chunk_seed is not None:
+        random.seed(chunk_seed)
+        np.random.seed(chunk_seed)
+
     # Remaining keys forwarded to process_stream
     process_kwargs = kwargs
 
@@ -304,7 +314,7 @@ def _chunk_worker(kwargs: dict) -> dict:
     }
 
 
-@dataclass
+@dataclass(slots=True)
 class Instrumentation:
     """
     Counters for sampling instrumentation.
@@ -317,7 +327,7 @@ class Instrumentation:
     spawned_virtual: int = 0
 
 
-@dataclass
+@dataclass(slots=True)
 class TrackedOrder:
     """
     Base class for tracked orders.
@@ -349,7 +359,7 @@ class TrackedOrder:
         self.status = "FILLED"
         self.end_time = mbo.ts_event
 
-    def on_censor(self, reason: str, mbo: Optional[db.MBOMsg] = None):
+    def on_censor(self, reason: str, mbo: db.MBOMsg | None = None):
         """Mark the order as censored for the given reason."""
         self.status = reason
         self.end_time = mbo.ts_event if mbo is not None else self.end_time
@@ -446,7 +456,7 @@ class TrackedOrder:
         return base
 
 
-@dataclass
+@dataclass(slots=True)
 class VirtualOrder(TrackedOrder):
     """
     Virtual (synthetic) order used for survival analysis sampling.
@@ -457,37 +467,37 @@ class VirtualOrder(TrackedOrder):
     """
 
     current_vahead: int = 0
-    ids_ahead: Dict[int, int] = field(default_factory=dict)
-    best_bid_at_entry: int = None
-    best_ask_at_entry: int = None
-    best_bid_at_post_trade: int = None
-    best_ask_at_post_trade: int = None
-    post_trade_deadline_ts: Optional[int] = None
+    ids_ahead: dict[int, int] = field(default_factory=dict)
+    best_bid_at_entry: int | None = None
+    best_ask_at_entry: int | None = None
+    best_bid_at_post_trade: int | None = None
+    best_ask_at_post_trade: int | None = None
+    post_trade_deadline_ts: int | None = None
 
     # Market-depth representation (41 dims)
-    entry_representation_market_depth: Optional[List] = None  # (T_hist, 41)
-    lob_sequence_market_depth: List[List[float]] = field(
+    entry_representation_market_depth: list | None = None  # (T_hist, 41)
+    lob_sequence_market_depth: list[list[float]] = field(
         default_factory=list
     )  # (T_var, 41)
 
     # Moving-window representation (41 dims)
-    entry_representation_moving_window: Optional[List] = None  # (T_hist, 41)
-    lob_sequence_moving_window: List[List[float]] = field(
+    entry_representation_moving_window: list | None = None  # (T_hist, 41)
+    lob_sequence_moving_window: list[list[float]] = field(
         default_factory=list
     )  # (T_var, 41)
 
     # Raw top-5 representation (20 dims: 5 bid levels * 2 + 5 ask levels * 2)
-    entry_representation_raw_top5: Optional[List] = None  # (T_hist, 20)
-    lob_sequence_raw_top5: List[List[float]] = field(
+    entry_representation_raw_top5: list | None = None  # (T_hist, 20)
+    lob_sequence_raw_top5: list[list[float]] = field(
         default_factory=list
     )  # (T_var, 20)
 
     # Toxicity representation (consistent across all modes)
-    toxicity_representation: Optional[List] = None  # (T_hist, toxicity_dim), no padding
-    lob_sequence: List[List[float]] = field(
+    toxicity_representation: list | None = None  # (T_hist, toxicity_dim), no padding
+    lob_sequence: list[list[float]] = field(
         default_factory=list
     )  # (T_var, 2W+1) - deprecated, kept for backward compat
-    toxicity_sequence: List[List[float]] = field(
+    toxicity_sequence: list[list[float]] = field(
         default_factory=list
     )  # (T_var, toxicity_dim)
 
@@ -553,52 +563,71 @@ class OrderTracker:
         time_censor_s: Optional maximum lifetime in seconds before an active
             order is censored as CENSORED_TIME. If None, no time censor is
             applied.
+        representation_modes: List of LOB representation modes to include.
+            Valid options: "market_depth", "moving_window", "raw_top5".
+            If None, defaults to all three modes for backward compatibility.
     """
 
     def __init__(
         self,
         samples_per_day: int = 100,
-        time_censor_s: Optional[float] = None,
-        random_seed: Optional[int] = CONFIG.random_seed,
-        labeler: Optional[BaseLabeler] = None,
-        representation_transform: Optional[BaseLOBTransform] = None,
+        time_censor_s: float | None = None,
+        random_seed: int | None = CONFIG.random_seed,
+        labeler: BaseLabeler | None = None,
+        representation_transform: BaseLOBTransform | None = None,
         include_representation: bool = True,
         lookback_period: int = 10,
-        snapshot_bin_s: Optional[float] = None,
+        snapshot_bin_s: float | None = None,
+        representation_modes: list[str] | None = None,
     ):
         self.market = Market()
-        self.active_virtual: List[VirtualOrder] = []
-        self.post_trade_virtual: List[VirtualOrder] = []
-        self.completed: List[TrackedOrder] = []
+        self.active_virtual: list[VirtualOrder] = []
+        self.post_trade_virtual: list[VirtualOrder] = []
+        self.completed: list[TrackedOrder] = []
 
         self.last_sample_time = 0
         self.virtual_oid_counter = 0
 
-        self.time_censor_ns: Optional[int] = (
+        self.time_censor_ns: int | None = (
             int(time_censor_s * 1e9) if time_censor_s is not None else None
         )
         self.random_seed = random_seed
         self._rng = random.Random(random_seed)
 
+        # Seed numpy as well for reproducible results
+        if random_seed is not None:
+            np.random.seed(random_seed)
+
         self.samples_per_day = samples_per_day
-        self.virtual_sample_schedule: Dict[int, List[int]] = {}
-        self.virtual_sample_index: Dict[int, int] = {}
-        self.pending_virtual: Dict[int, List[int]] = {}
+        self.virtual_sample_schedule: dict[int, list[int]] = {}
+        self.virtual_sample_index: dict[int, int] = {}
+        self.pending_virtual: dict[int, list[int]] = {}
 
         self.labeler = labeler or ExecutionCompetingRisksLabeler()
+
+        # Set default representation modes if not specified (backward compatible)
+        if representation_modes is None:
+            representation_modes = ["market_depth", "moving_window", "raw_top5"]
+        self.representation_modes = set(representation_modes)
 
         # Create three separate representation transforms for all modes
         self.representation_transform = (
             representation_transform or RepresentationTransform()
         )
-        self.representation_transform_market_depth = RepresentationTransform(
-            representation="market_depth"
+        self.representation_transform_market_depth = (
+            RepresentationTransform(representation="market_depth")
+            if "market_depth" in self.representation_modes
+            else None
         )
-        self.representation_transform_moving_window = RepresentationTransform(
-            representation="moving_window"
+        self.representation_transform_moving_window = (
+            RepresentationTransform(representation="moving_window")
+            if "moving_window" in self.representation_modes
+            else None
         )
-        self.representation_transform_raw_top5 = RepresentationTransform(
-            representation="raw_top5"
+        self.representation_transform_raw_top5 = (
+            RepresentationTransform(representation="raw_top5")
+            if "raw_top5" in self.representation_modes
+            else None
         )
 
         self.toxicity_features = ToxicityFeatures()
@@ -624,6 +653,7 @@ class OrderTracker:
             include_representation=include_representation,
             lookback_period=lookback_period,
             snapshot_bin_s=_bin_s,
+            representation_modes=representation_modes,
         )
 
     def _apply_labeling(self, record: Dict[str, Any]) -> Dict[str, Any]:
@@ -682,6 +712,37 @@ class OrderTracker:
         order.status = "CENSORED_TIME"
         return True
 
+    def _filter_record_by_representation_modes(
+        self, record: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Filter a record to exclude representation columns for unselected modes.
+
+        Args:
+            record: Dictionary record from TrackedOrder.to_dict()
+
+        Returns:
+            Filtered dictionary with only selected representation columns.
+        """
+        rep_columns = {
+            "market_depth": [
+                "entry_representation_market_depth",
+                "lob_sequence_market_depth",
+            ],
+            "moving_window": [
+                "entry_representation_moving_window",
+                "lob_sequence_moving_window",
+            ],
+            "raw_top5": ["entry_representation_raw_top5", "lob_sequence_raw_top5"],
+        }
+
+        for mode, columns in rep_columns.items():
+            if mode not in self.representation_modes:
+                for col in columns:
+                    record.pop(col, None)
+
+        return record
+
     def _maybe_flush(
         self, out_buffer, parquet_writer, output_parquet, parquet_batch_size
     ):
@@ -699,7 +760,11 @@ class OrderTracker:
         """
         if len(out_buffer) >= parquet_batch_size:
             output_parquet = _prepare_output_path(output_parquet)
-            table = pa.Table.from_pylist(out_buffer)
+            # Filter records to include only selected representation modes
+            filtered_buffer = [
+                self._filter_record_by_representation_modes(rec) for rec in out_buffer
+            ]
+            table = pa.Table.from_pylist(filtered_buffer)
             if parquet_writer is None:
                 parquet_writer = pq.ParquetWriter(output_parquet, table.schema)
             parquet_writer.write_table(table)
@@ -869,7 +934,7 @@ class OrderTracker:
 
     def _get_entry_feature_sequences(
         self,
-    ) -> tuple[
+    ) -> Tuple[
         List[List[float]],
         List[List[float]],
         List[List[float]],
@@ -896,7 +961,10 @@ class OrderTracker:
 
         try:
             # Market depth representation
-            if self.representation_transform_market_depth is not None:
+            if (
+                "market_depth" in self.representation_modes
+                and self.representation_transform_market_depth is not None
+            ):
                 md_tensor = self.representation_transform_market_depth.transform_sequence_from_dicts(
                     buf,
                     self.lookback_period,
@@ -905,7 +973,10 @@ class OrderTracker:
                 entry_market_depth = md_tensor.tolist()
 
             # Moving window representation
-            if self.representation_transform_moving_window is not None:
+            if (
+                "moving_window" in self.representation_modes
+                and self.representation_transform_moving_window is not None
+            ):
                 mw_tensor = self.representation_transform_moving_window.transform_sequence_from_dicts(
                     buf,
                     self.lookback_period,
@@ -914,7 +985,10 @@ class OrderTracker:
                 entry_moving_window = mw_tensor.tolist()
 
             # Raw top-5 representation
-            if self.representation_transform_raw_top5 is not None:
+            if (
+                "raw_top5" in self.representation_modes
+                and self.representation_transform_raw_top5 is not None
+            ):
                 rt_tensor = self.representation_transform_raw_top5.transform_sequence_from_dicts(
                     buf,
                     self.lookback_period,
@@ -1077,13 +1151,35 @@ class OrderTracker:
                 ids_ahead=ids_ahead,
                 best_bid_at_entry=best_bid.price if best_bid else None,
                 best_ask_at_entry=best_ask.price if best_ask else None,
-                entry_representation_market_depth=entry_market_depth,
-                entry_representation_moving_window=entry_moving_window,
-                entry_representation_raw_top5=entry_raw_top5,
+                entry_representation_market_depth=(
+                    entry_market_depth
+                    if "market_depth" in self.representation_modes
+                    else None
+                ),
+                entry_representation_moving_window=(
+                    entry_moving_window
+                    if "moving_window" in self.representation_modes
+                    else None
+                ),
+                entry_representation_raw_top5=(
+                    entry_raw_top5 if "raw_top5" in self.representation_modes else None
+                ),
                 toxicity_representation=bid_toxicity_representation,
-                lob_sequence_market_depth=[list(row) for row in entry_market_depth],
-                lob_sequence_moving_window=[list(row) for row in entry_moving_window],
-                lob_sequence_raw_top5=[list(row) for row in entry_raw_top5],
+                lob_sequence_market_depth=(
+                    [list(row) for row in entry_market_depth]
+                    if "market_depth" in self.representation_modes
+                    else []
+                ),
+                lob_sequence_moving_window=(
+                    [list(row) for row in entry_moving_window]
+                    if "moving_window" in self.representation_modes
+                    else []
+                ),
+                lob_sequence_raw_top5=(
+                    [list(row) for row in entry_raw_top5]
+                    if "raw_top5" in self.representation_modes
+                    else []
+                ),
                 lob_sequence=[],  # deprecated, kept for backward compat
                 toxicity_sequence=[list(row) for row in bid_toxicity_representation],
             )
@@ -1127,13 +1223,35 @@ class OrderTracker:
                 ids_ahead=ids_ahead,
                 best_bid_at_entry=best_bid.price if best_bid else None,
                 best_ask_at_entry=best_ask.price if best_ask else None,
-                entry_representation_market_depth=entry_market_depth,
-                entry_representation_moving_window=entry_moving_window,
-                entry_representation_raw_top5=entry_raw_top5,
+                entry_representation_market_depth=(
+                    entry_market_depth
+                    if "market_depth" in self.representation_modes
+                    else None
+                ),
+                entry_representation_moving_window=(
+                    entry_moving_window
+                    if "moving_window" in self.representation_modes
+                    else None
+                ),
+                entry_representation_raw_top5=(
+                    entry_raw_top5 if "raw_top5" in self.representation_modes else None
+                ),
                 toxicity_representation=ask_toxicity_representation,
-                lob_sequence_market_depth=[list(row) for row in entry_market_depth],
-                lob_sequence_moving_window=[list(row) for row in entry_moving_window],
-                lob_sequence_raw_top5=[list(row) for row in entry_raw_top5],
+                lob_sequence_market_depth=(
+                    [list(row) for row in entry_market_depth]
+                    if "market_depth" in self.representation_modes
+                    else []
+                ),
+                lob_sequence_moving_window=(
+                    [list(row) for row in entry_moving_window]
+                    if "moving_window" in self.representation_modes
+                    else []
+                ),
+                lob_sequence_raw_top5=(
+                    [list(row) for row in entry_raw_top5]
+                    if "raw_top5" in self.representation_modes
+                    else []
+                ),
                 lob_sequence=[],  # deprecated, kept for backward compat
                 toxicity_sequence=[list(row) for row in ask_toxicity_representation],
             )
@@ -1425,7 +1543,11 @@ class OrderTracker:
 
         if out_buffer:
             output_parquet = _prepare_output_path(output_parquet)
-            table = pa.Table.from_pylist(out_buffer)
+            # Filter records to include only selected representation modes
+            filtered_buffer = [
+                self._filter_record_by_representation_modes(rec) for rec in out_buffer
+            ]
+            table = pa.Table.from_pylist(filtered_buffer)
             if parquet_writer is None:
                 parquet_writer = pq.ParquetWriter(output_parquet, table.schema)
             parquet_writer.write_table(table)
