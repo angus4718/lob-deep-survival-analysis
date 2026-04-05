@@ -9,6 +9,14 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pandas as pd
 
+# Ensure reproducible results across parallel runs
+# Must be set BEFORE importing numpy or spawning processes
+if "PYTHONHASHSEED" not in os.environ:
+    os.environ["PYTHONHASHSEED"] = "0"
+
+import numpy as np
+import random
+
 # Ensure project root is in sys.path for src imports
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -27,15 +35,20 @@ ADAPTIVE_TOXIC_WINDOW = True
 SKIP_FIRST_SEGMENT_IF_RAW_DATA_EXISTS = True
 
 SYMBOL = "AAPL"
-START_DATE = "2025-11-01"
-END_DATE = "2025-12-01"
+START_DATE = "2025-10-01"
+END_DATE = "2025-11-01"
 
 SAMPLES_PER_DAY = 1000
 # Keep long-lived orders for dynamic models; disable fixed time censoring.
 TIME_CENSOR_S = None
-LOOKBACK_PERIOD = 20
+LOOKBACK_PERIOD = 200
 RANDOM_SEED = CONFIG.random_seed
 PROGRESS_INTERVAL = 100_000
+
+# LOB representation modes to include in dataset.
+# Valid options: "market_depth", "moving_window", "raw_top5"
+# Default: all three modes.
+REPRESENTATION_MODES = ["raw_top5"]
 
 # Set to a "YYYY-MM-DD" string to restrict processing to a single trading day,
 # or None to process the entire file.
@@ -206,6 +219,11 @@ def _process_adaptive_toxic_window(raw_output_path: Path, final_output_path: Pat
 
 
 def main() -> None:
+    # Ensure reproducibility by seeding all random sources
+    if RANDOM_SEED is not None:
+        random.seed(RANDOM_SEED)
+        np.random.seed(RANDOM_SEED)
+
     global N_WORKERS
     if N_WORKERS is None:
         total_cores = multiprocessing.cpu_count()
@@ -233,7 +251,8 @@ def main() -> None:
             time_censor_s=TIME_CENSOR_S,
             lookback_period=LOOKBACK_PERIOD,
             random_seed=RANDOM_SEED,
-            raw_data_mode=ADAPTIVE_TOXIC_WINDOW
+            raw_data_mode=ADAPTIVE_TOXIC_WINDOW,
+            representation_modes=REPRESENTATION_MODES,
         )
 
         if N_WORKERS > 1:

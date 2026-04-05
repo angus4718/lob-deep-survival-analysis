@@ -6,6 +6,8 @@ https://databento.com/docs/examples/order-book/limit-order-book
 from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import takewhile
+from typing import DefaultDict
+
 import databento as db
 from sortedcontainers import SortedDict
 
@@ -18,7 +20,7 @@ class PriceLevel:
 
     def __str__(self) -> str:
         price = self.price / db.FIXED_PRICE_SCALE
-        return f"{self.size:4} @ {price:6.2f} | {self.count:2} order(s)"
+        return f"{self.size=} @ {price=:.2f} | {self.count=} order(s)"
 
 
 @dataclass(slots=True)
@@ -41,8 +43,8 @@ class LevelOrders:
 @dataclass(slots=True)
 class Book:
     orders_by_id: dict[int, db.MBOMsg] = field(default_factory=dict)
-    offers: SortedDict[int, LevelOrders] = field(default_factory=SortedDict)
-    bids: SortedDict[int, LevelOrders] = field(default_factory=SortedDict)
+    offers: SortedDict = field(default_factory=SortedDict)
+    bids: SortedDict = field(default_factory=SortedDict)
 
     def bbo(self) -> tuple[PriceLevel | None, PriceLevel | None]:
         return self.get_bid_level(), self.get_ask_level()
@@ -183,12 +185,12 @@ class Book:
             return self.offers
         if side == "B":
             return self.bids
-        raise ValueError(f"Invalid {side =}")
+        raise ValueError(f"Invalid side={side}")
 
     def _get_level(self, price: int, side: str) -> LevelOrders:
         levels = self._side_levels(side)
         if price not in levels:
-            raise KeyError(f"No price level found for {price =} and {side =}")
+            raise KeyError(f"No price level found for price={price} and side={side}")
         return levels[price]
 
     def _get_or_insert_level(self, price: int, side: str) -> LevelOrders:
@@ -206,11 +208,11 @@ class Book:
 
 @dataclass(slots=True)
 class Market:
-    books: defaultdict[int, defaultdict[int, Book]] = field(
+    books: DefaultDict[int, DefaultDict[int, Book]] = field(
         default_factory=lambda: defaultdict(lambda: defaultdict(Book)),
     )
 
-    def get_books_by_pub(self, instrument_id: int) -> defaultdict[int, Book]:
+    def get_books_by_pub(self, instrument_id: int) -> DefaultDict[int, Book]:
         return self.books[instrument_id]
 
     def get_book(self, instrument_id: int, publisher_id: int) -> Book:

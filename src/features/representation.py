@@ -15,7 +15,7 @@ Learning Models in Limit Order Books."
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Sequence
+from typing import Sequence, List, Dict, Optional, Tuple
 
 import torch
 
@@ -24,7 +24,7 @@ from ..config import CONFIG
 from ..lob_implementation import Book
 
 
-@dataclass
+@dataclass(slots=True)
 class RepresentationTransform(BaseLOBTransform):
     """Mid-price centered moving-window or market-depth representation."""
 
@@ -100,7 +100,7 @@ class RepresentationTransform(BaseLOBTransform):
             mid = 0.5 * (best_bid + best_ask)
             center = self._anchor_mid(mid)
 
-        features: list[torch.Tensor] = []
+        features: List[torch.Tensor] = []
         for bids, asks in snapshots:
             if self.representation == "moving_window":
                 vals = self._moving_window(bids, asks, center)
@@ -154,7 +154,7 @@ class RepresentationTransform(BaseLOBTransform):
 
         return torch.tensor(values, dtype=torch.float32)
 
-    def _center_from_state(self, lob_state: Book) -> int | None:
+    def _center_from_state(self, lob_state: Book) -> Optional[int]:
         """Compute mid-price center anchored to the tick grid."""
         bid_levels, ask_levels = self._levels_from_book(lob_state)
         if not bid_levels or not ask_levels:
@@ -166,7 +166,7 @@ class RepresentationTransform(BaseLOBTransform):
 
     def _levels_from_book(
         self, book: Book
-    ) -> tuple[Dict[int, float], Dict[int, float]]:
+    ) -> Tuple[Dict[int, float], Dict[int, float]]:
         """Extract bid and ask price->size maps from a Book object."""
         bids = {px: level.level.size for px, level in book.bids.items()}
         asks = {px: level.level.size for px, level in book.offers.items()}
@@ -183,7 +183,7 @@ class RepresentationTransform(BaseLOBTransform):
         center: int,
     ) -> list[float]:
         """Return signed volumes on a centered price grid."""
-        values: list[float] = []
+        values: List[float] = []
         for offset in range(-self.window, self.window + 1):
             price = center + offset * self.tick_size
             ask_vol = asks.get(price, 0.0)
@@ -197,7 +197,7 @@ class RepresentationTransform(BaseLOBTransform):
         bids: Dict[int, float],
         asks: Dict[int, float],
         center: int,
-    ) -> list[float]:
+    ) -> List[float]:
         """Return cumulative signed depth from the center outwards."""
         values = [0.0 for _ in range(2 * self.window + 1)]
         cum_ask = 0.0
@@ -215,7 +215,7 @@ class RepresentationTransform(BaseLOBTransform):
         self,
         bids: Dict[int, float],
         asks: Dict[int, float],
-    ) -> list[float]:
+    ) -> List[float]:
         """Return raw top 5 bid and ask price-volume pairs.
 
         Returns a 20-feature vector:
@@ -224,7 +224,7 @@ class RepresentationTransform(BaseLOBTransform):
 
         Missing levels are filled with 0.0 (price and volume).
         """
-        values: list[float] = []
+        values: List[float] = []
 
         # Top 5 bid levels (best to 5th best)
         bid_prices_sorted = sorted(bids.keys(), reverse=True)[:5]
