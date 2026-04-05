@@ -228,37 +228,36 @@ class RepresentationTransform(BaseLOBTransform):
         bids: Dict[int, float],
         asks: Dict[int, float],
     ) -> List[float]:
-        """Return raw top 5 bid and ask price-volume pairs with absolute prices.
+        """Return raw top-5 levels as interleaved ask/bid price-volume pairs.
 
-        Returns a 20-feature vector in bid-first, then ask-first order:
-        [bid_price_1, bid_vol_1, bid_price_2, bid_vol_2, ..., bid_price_5, bid_vol_5,
-         ask_price_1, ask_vol_1, ask_price_2, ask_vol_2, ..., ask_price_5, ask_vol_5]
+        Returns a 20-feature vector in level order:
+        [ask_price_1, ask_vol_1, bid_price_1, bid_vol_1,
+         ask_price_2, ask_vol_2, bid_price_2, bid_vol_2,
+         ...,
+         ask_price_5, ask_vol_5, bid_price_5, bid_vol_5]
 
         Uses 0-padding for missing levels (both price and volume).
         """
         values: List[float] = []
 
-        # Top 5 bid levels (best to 5th best)
         bid_prices_sorted = sorted(bids.keys(), reverse=True)[:5]
-        for i in range(5):
-            if i < len(bid_prices_sorted):
-                bid_price = bid_prices_sorted[i]
-                values.append(float(bid_price))
-                values.append(float(bids[bid_price]))
-            else:
-                # Missing level: zero-pad
-                values.append(0.0)
-                values.append(0.0)
-
-        # Top 5 ask levels (best to 5th best)
         ask_prices_sorted = sorted(asks.keys())[:5]
+
+        # Interleave per level: ask_i, ask_vol_i, bid_i, bid_vol_i
         for i in range(5):
             if i < len(ask_prices_sorted):
                 ask_price = ask_prices_sorted[i]
                 values.append(float(ask_price))
                 values.append(float(asks[ask_price]))
             else:
-                # Missing level: zero-pad
+                values.append(0.0)
+                values.append(0.0)
+
+            if i < len(bid_prices_sorted):
+                bid_price = bid_prices_sorted[i]
+                values.append(float(bid_price))
+                values.append(float(bids[bid_price]))
+            else:
                 values.append(0.0)
                 values.append(0.0)
 
@@ -269,11 +268,13 @@ class RepresentationTransform(BaseLOBTransform):
         bids: Dict[int, float],
         asks: Dict[int, float],
     ) -> List[float]:
-        """Return top 5 bid and ask price-volume pairs with absolute price differences.
+        """Return top-5 levels as interleaved ask/bid (price-mid, volume) pairs.
 
-        Returns a 20-feature vector in bid-first, then ask-first order:
-        [bid_price_diff_1, bid_vol_1, bid_price_diff_2, bid_vol_2, ..., bid_price_diff_5, bid_vol_5,
-         ask_price_diff_1, ask_vol_1, ask_price_diff_2, ask_vol_2, ..., ask_price_diff_5, ask_vol_5]
+        Returns a 20-feature vector in level order:
+        [ask_price_diff_1, ask_vol_1, bid_price_diff_1, bid_vol_1,
+         ask_price_diff_2, ask_vol_2, bid_price_diff_2, bid_vol_2,
+         ...,
+         ask_price_diff_5, ask_vol_5, bid_price_diff_5, bid_vol_5]
 
         Where price_diff = price - mid (absolute difference, not normalized by mid).
 
@@ -293,26 +294,12 @@ class RepresentationTransform(BaseLOBTransform):
         else:
             mid = 0.0  # Default mid if no levels
 
-        # Top 5 bid levels (best to 5th best)
-        # Use last-observation-carried-forward for missing prices
+        # Top 5 levels (best to 5th best), interleaved ask then bid.
         bid_prices_sorted = bid_prices_all[:5]
-        last_bid_price_diff = 0.0
-        for i in range(5):
-            if i < len(bid_prices_sorted):
-                bid_price = bid_prices_sorted[i]
-                bid_price_diff = bid_price - mid
-                last_bid_price_diff = bid_price_diff
-                values.append(bid_price_diff)
-                values.append(float(bids[bid_price]))
-            else:
-                # Missing level: carry forward last price, zero volume
-                values.append(last_bid_price_diff)
-                values.append(0.0)
-
-        # Top 5 ask levels (best to 5th best)
-        # Use last-observation-carried-forward for missing prices
         ask_prices_sorted = ask_prices_all[:5]
+        last_bid_price_diff = 0.0
         last_ask_price_diff = 0.0
+
         for i in range(5):
             if i < len(ask_prices_sorted):
                 ask_price = ask_prices_sorted[i]
@@ -323,6 +310,17 @@ class RepresentationTransform(BaseLOBTransform):
             else:
                 # Missing level: carry forward last price, zero volume
                 values.append(last_ask_price_diff)
+                values.append(0.0)
+
+            if i < len(bid_prices_sorted):
+                bid_price = bid_prices_sorted[i]
+                bid_price_diff = bid_price - mid
+                last_bid_price_diff = bid_price_diff
+                values.append(bid_price_diff)
+                values.append(float(bids[bid_price]))
+            else:
+                # Missing level: carry forward last price, zero volume
+                values.append(last_bid_price_diff)
                 values.append(0.0)
 
         return values

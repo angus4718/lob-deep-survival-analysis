@@ -9,8 +9,6 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pandas as pd
 
-# Ensure reproducible results across parallel runs
-# Must be set BEFORE importing numpy or spawning processes
 # pip install --break-system-packages -r requirements.txt
 """
 # 1. Create a 16GB file for swap
@@ -25,11 +23,6 @@ sudo mkswap /swapfile
 # 4. Enable the swap
 sudo swapon /swapfile
 """
-if "PYTHONHASHSEED" not in os.environ:
-    os.environ["PYTHONHASHSEED"] = "0"
-
-import numpy as np
-import random
 
 # Ensure project root is in sys.path for src imports
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -242,11 +235,6 @@ def _process_adaptive_toxic_window(
 
 
 def main() -> None:
-    # Ensure reproducibility by seeding all random sources
-    if RANDOM_SEED is not None:
-        random.seed(RANDOM_SEED)
-        np.random.seed(RANDOM_SEED)
-
     global N_WORKERS
     if N_WORKERS is None:
         total_cores = multiprocessing.cpu_count()

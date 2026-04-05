@@ -14,6 +14,7 @@ The main classes are:
 """
 
 import collections
+import hashlib
 import os
 import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -24,7 +25,6 @@ import databento as db
 from dataclasses import dataclass, field
 from typing import Callable, Any, List, Dict, Optional, Tuple
 import random
-import numpy as np
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -273,8 +273,6 @@ def _chunk_worker(kwargs: dict) -> dict:
         ``spawned_virtual``.
     """
     import sys
-    import random
-    import numpy as np
 
     project_root = kwargs.pop("_project_root", None)
     if project_root and project_root not in sys.path:
@@ -289,12 +287,6 @@ def _chunk_worker(kwargs: dict) -> dict:
     chunk_ts_start: Optional[int] = kwargs.pop("chunk_ts_start", None)
     chunk_ts_end: Optional[int] = kwargs.pop("chunk_ts_end", None)
     chunk_idx: int = kwargs.pop("chunk_idx", 0)
-
-    # Seed this worker process with its chunk-specific seed
-    chunk_seed = tracker_kwargs.get("random_seed")
-    if chunk_seed is not None:
-        random.seed(chunk_seed)
-        np.random.seed(chunk_seed)
 
     # Remaining keys forwarded to process_stream
     process_kwargs = kwargs
@@ -658,11 +650,6 @@ class OrderTracker:
             int(time_censor_s * 1e9) if time_censor_s is not None else None
         )
         self.random_seed = random_seed
-        self._rng = random.Random(random_seed)
-
-        # Seed numpy as well for reproducible results
-        if random_seed is not None:
-            np.random.seed(random_seed)
 
         self.samples_per_day = samples_per_day
         self.virtual_sample_schedule: dict[int, list[int]] = {}
@@ -846,17 +833,35 @@ class OrderTracker:
         return out_buffer, parquet_writer
 
     def _init_day_schedule(self, day, day_start_ns, day_end_ns, samples_per_day):
-        """Create per-day random sampling schedules if not already present."""
+        """Create deterministic per-day schedules if not already present."""
         if day in self.virtual_sample_schedule:
             return
         self.samples_per_day = samples_per_day
-        v_times: List[int] = []
         # Schedule virtual sampling times
         virtual_target = self.samples_per_day
         v_count = max(1, (virtual_target + 1) // 2)
-        v_times = sorted(
-            int(self._rng.uniform(day_start_ns, day_end_ns)) for _ in range(v_count)
+
+        # Derive day-specific RNG from stable inputs so schedules are invariant
+        # to worker count and chunk execution order.
+        seed_material = (
+            f"{self.random_seed}|{day}|{day_start_ns}|{day_end_ns}|{samples_per_day}"
+        ).encode("ascii")
+        day_seed = int.from_bytes(
+            hashlib.sha256(seed_material).digest()[:8], "big", signed=False
         )
+        day_rng = random.Random(day_seed)
+        v_times = sorted(
+            int(day_rng.uniform(day_start_ns, day_end_ns)) for _ in range(v_count)
+        )
+
+        # In chunked mode, keep only samples whose timestamps belong to this chunk.
+        chunk_start = getattr(self, "_chunk_ts_start", None)
+        chunk_end = getattr(self, "_chunk_ts_end", None)
+        if chunk_start is not None:
+            v_times = [t for t in v_times if t >= chunk_start]
+        if chunk_end is not None:
+            v_times = [t for t in v_times if t < chunk_end]
+
         self.virtual_sample_schedule[day] = v_times
         self.virtual_sample_index[day] = 0
         self.inst.scheduled_virtual += len(v_times) * 2
@@ -1479,6 +1484,8 @@ class OrderTracker:
             tqdm_desc: Label shown to the left of the progress bar.
         """
         output_parquet = _prepare_output_path(output_parquet)
+        self._chunk_ts_start = chunk_ts_start
+        self._chunk_ts_end = chunk_ts_end
         data = db.DBNStore.from_file(file_path)
         count = 0
         last_ts = 0
@@ -1947,7 +1954,7 @@ class OrderTracker:
 
             worker_tracker_kwargs = dict(self._init_kwargs)
             if self.random_seed is not None:
-                worker_tracker_kwargs["random_seed"] = self.random_seed + i
+                worker_tracker_kwargs["random_seed"] = self.random_seed
 
             worker_args.append(
                 dict(
