@@ -380,23 +380,26 @@ class ToxicityFeatures(BaseLOBTransform):
 
         Computes 18 toxicity metrics for each snapshot in the lookback window,
         producing a time series where each feature evolves over the lookback period.
+        An additional time delta feature (milliseconds) is appended to each row.
 
         Args:
-            snapshots: Sequence of (bids, asks) dict tuples where keys are prices,
-                      values are sizes. Typically from _lob_snapshot_buffer.
+            snapshots: Sequence of (bids, asks) dict tuples or (bids, asks, ts) tuples
+                      where keys are prices, values are sizes. Timestamps (if present)
+                      are used to compute inter-snapshot time deltas.
             n_lookback: Required number of time steps in output. If fewer snapshots
                        are provided, zero-pads at the beginning.
 
         Returns:
-            Float tensor of shape (n_lookback, 18) where:
+            Float tensor of shape (n_lookback, 19) where:
             - Each row is one snapshot in the lookback period
-            - Each column is one of 18 toxicity metrics
+            - Columns 0-17: 18 toxicity metrics
+            - Column 18: time delta in milliseconds (0.0 for first snapshot)
             - All features are raw (unscaled) values
 
-            If ``pad_to_length=False``, returns shape ``(T, 18)`` where ``T``
+            If ``pad_to_length=False``, returns shape ``(T, 19)`` where ``T``
             is the number of available snapshots.
         """
-        feature_dim = self._feature_dim()
+        feature_dim = self._feature_dim() + 1  # +1 for time delta
 
         if not snapshots:
             if pad_to_length:
@@ -405,9 +408,21 @@ class ToxicityFeatures(BaseLOBTransform):
 
         # Extract features for each snapshot
         features_list = []
-        for bids_dict, asks_dict in snapshots:
+        prev_ts = None
+        for bids_dict, asks_dict, ts in snapshots:
+            # Compute time delta in milliseconds
+            if prev_ts is not None:
+                time_delta_ms = (ts - prev_ts) / 1e6  # ns to ms
+            else:
+                time_delta_ms = 0.0
+            prev_ts = ts
+
             features = self._extract_features_from_dicts(bids_dict, asks_dict)
-            features_list.append(features)
+            # Append time delta as the last feature
+            features_with_delta = torch.cat(
+                [features, torch.tensor([time_delta_ms], dtype=torch.float32)]
+            )
+            features_list.append(features_with_delta)
 
         # Stack into (T, 18) tensor
         if features_list:

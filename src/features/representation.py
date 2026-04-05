@@ -61,7 +61,7 @@ class RepresentationTransform(BaseLOBTransform):
         Uses the most recent snapshot's mid-price as the common center for all
         time steps. By default, if fewer than ``n_lookback`` snapshots are
         available the result is zero-padded at the beginning so the output has
-        shape ``(n_lookback, 2W+1)`` or ``(n_lookback, 20)`` for raw_top5.
+        shape ``(n_lookback, 2W+1)`` or ``(n_lookback, 20)`` for raw_top5/diff_top5.
         When ``pad_to_length`` is False, the method returns only the available
         snapshots without padding/truncation.
 
@@ -76,7 +76,7 @@ class RepresentationTransform(BaseLOBTransform):
             where ``T`` is the number of available snapshots.
         """
         # Determine output width based on representation type
-        if self.representation == "raw_top5":
+        if self.representation in ("raw_top5", "diff_top5"):
             width = 20
         else:
             width = 2 * self.window + 1
@@ -86,30 +86,40 @@ class RepresentationTransform(BaseLOBTransform):
                 return torch.zeros((n_lookback, width), dtype=torch.float32)
             return torch.zeros((0, width), dtype=torch.float32)
 
-        bids_last, asks_last = snapshots[-1]
+        bids_last, asks_last = snapshots[-1][:2]
         if not bids_last or not asks_last:
             if pad_to_length:
                 return torch.zeros((n_lookback, width), dtype=torch.float32)
             return torch.zeros((0, width), dtype=torch.float32)
 
-        # For raw_top5, center is not needed
+        # For raw_top5 and diff_top5, center is not needed
         center = None
-        if self.representation != "raw_top5":
+        if self.representation not in ("raw_top5", "diff_top5"):
             best_bid = max(bids_last.keys())
             best_ask = min(asks_last.keys())
             mid = 0.5 * (best_bid + best_ask)
             center = self._anchor_mid(mid)
 
         features: List[torch.Tensor] = []
-        for bids, asks in snapshots:
+        for snapshot_tuple in snapshots:
+            # Handle both old (bids, asks) and new (bids, asks, ts) formats
+            # but ignore the timestamp for LOB representations
+            if isinstance(snapshot_tuple, tuple) and len(snapshot_tuple) >= 2:
+                bids, asks = snapshot_tuple[:2]
+            else:
+                continue
+
             if self.representation == "moving_window":
                 vals = self._moving_window(bids, asks, center)
             elif self.representation == "market_depth":
                 vals = self._market_depth(bids, asks, center)
             elif self.representation == "raw_top5":
                 vals = self._raw_top5(bids, asks)
+            elif self.representation == "diff_top5":
+                vals = self._diff_top5(bids, asks)
             else:
                 raise ValueError(f"Unknown representation: {self.representation}")
+
             features.append(torch.tensor(vals, dtype=torch.float32))
 
         tensor = torch.stack(features, dim=0)
@@ -138,7 +148,7 @@ class RepresentationTransform(BaseLOBTransform):
         bid_levels, ask_levels = self._levels_from_book(lob_state)
         if not bid_levels or not ask_levels:
             # Return appropriately sized zero tensor based on representation type
-            if self.representation == "raw_top5":
+            if self.representation in ("raw_top5", "diff_top5"):
                 return torch.zeros((20,), dtype=torch.float32)
             else:
                 return torch.zeros((2 * self.window + 1,), dtype=torch.float32)
@@ -149,6 +159,8 @@ class RepresentationTransform(BaseLOBTransform):
             values = self._market_depth(bid_levels, ask_levels, center)
         elif self.representation == "raw_top5":
             values = self._raw_top5(bid_levels, ask_levels)
+        elif self.representation == "diff_top5":
+            values = self._diff_top5(bid_levels, ask_levels)
         else:
             raise ValueError(f"Unknown representation: {self.representation}")
 
@@ -216,13 +228,13 @@ class RepresentationTransform(BaseLOBTransform):
         bids: Dict[int, float],
         asks: Dict[int, float],
     ) -> List[float]:
-        """Return raw top 5 bid and ask price-volume pairs.
+        """Return raw top 5 bid and ask price-volume pairs with absolute prices.
 
-        Returns a 20-feature vector:
-        [bid_price_1, bid_vol_1, ..., bid_price_5, bid_vol_5,
-         ask_price_1, ask_vol_1, ..., ask_price_5, ask_vol_5]
+        Returns a 20-feature vector in bid-first, then ask-first order:
+        [bid_price_1, bid_vol_1, bid_price_2, bid_vol_2, ..., bid_price_5, bid_vol_5,
+         ask_price_1, ask_vol_1, ask_price_2, ask_vol_2, ..., ask_price_5, ask_vol_5]
 
-        Missing levels are filled with 0.0 (price and volume).
+        Uses 0-padding for missing levels (both price and volume).
         """
         values: List[float] = []
 
@@ -230,10 +242,11 @@ class RepresentationTransform(BaseLOBTransform):
         bid_prices_sorted = sorted(bids.keys(), reverse=True)[:5]
         for i in range(5):
             if i < len(bid_prices_sorted):
-                price = bid_prices_sorted[i]
-                values.append(float(price))
-                values.append(float(bids[price]))
+                bid_price = bid_prices_sorted[i]
+                values.append(float(bid_price))
+                values.append(float(bids[bid_price]))
             else:
+                # Missing level: zero-pad
                 values.append(0.0)
                 values.append(0.0)
 
@@ -241,11 +254,75 @@ class RepresentationTransform(BaseLOBTransform):
         ask_prices_sorted = sorted(asks.keys())[:5]
         for i in range(5):
             if i < len(ask_prices_sorted):
-                price = ask_prices_sorted[i]
-                values.append(float(price))
-                values.append(float(asks[price]))
+                ask_price = ask_prices_sorted[i]
+                values.append(float(ask_price))
+                values.append(float(asks[ask_price]))
             else:
+                # Missing level: zero-pad
                 values.append(0.0)
+                values.append(0.0)
+
+        return values
+
+    def _diff_top5(
+        self,
+        bids: Dict[int, float],
+        asks: Dict[int, float],
+    ) -> List[float]:
+        """Return top 5 bid and ask price-volume pairs with absolute price differences.
+
+        Returns a 20-feature vector in bid-first, then ask-first order:
+        [bid_price_diff_1, bid_vol_1, bid_price_diff_2, bid_vol_2, ..., bid_price_diff_5, bid_vol_5,
+         ask_price_diff_1, ask_vol_1, ask_price_diff_2, ask_vol_2, ..., ask_price_diff_5, ask_vol_5]
+
+        Where price_diff = price - mid (absolute difference, not normalized by mid).
+
+        For missing levels: uses last-observation-carried-forward for price differences
+        and zero-padding for volumes (to signal absence of deeper liquidity).
+        """
+        values: List[float] = []
+
+        # Calculate mid price from best bid and ask
+        bid_prices_all = sorted(bids.keys(), reverse=True)
+        ask_prices_all = sorted(asks.keys())
+
+        if bid_prices_all and ask_prices_all:
+            best_bid = bid_prices_all[0]
+            best_ask = ask_prices_all[0]
+            mid = 0.5 * (best_bid + best_ask)
+        else:
+            mid = 0.0  # Default mid if no levels
+
+        # Top 5 bid levels (best to 5th best)
+        # Use last-observation-carried-forward for missing prices
+        bid_prices_sorted = bid_prices_all[:5]
+        last_bid_price_diff = 0.0
+        for i in range(5):
+            if i < len(bid_prices_sorted):
+                bid_price = bid_prices_sorted[i]
+                bid_price_diff = bid_price - mid
+                last_bid_price_diff = bid_price_diff
+                values.append(bid_price_diff)
+                values.append(float(bids[bid_price]))
+            else:
+                # Missing level: carry forward last price, zero volume
+                values.append(last_bid_price_diff)
+                values.append(0.0)
+
+        # Top 5 ask levels (best to 5th best)
+        # Use last-observation-carried-forward for missing prices
+        ask_prices_sorted = ask_prices_all[:5]
+        last_ask_price_diff = 0.0
+        for i in range(5):
+            if i < len(ask_prices_sorted):
+                ask_price = ask_prices_sorted[i]
+                ask_price_diff = ask_price - mid
+                last_ask_price_diff = ask_price_diff
+                values.append(ask_price_diff)
+                values.append(float(asks[ask_price]))
+            else:
+                # Missing level: carry forward last price, zero volume
+                values.append(last_ask_price_diff)
                 values.append(0.0)
 
         return values
