@@ -416,7 +416,7 @@ class TrackedOrder:
                 self, "best_ask_at_post_trade", None
             )
 
-            # Three LOB representation modes
+            # Four LOB representation modes
             base["entry_representation_market_depth"] = getattr(
                 self, "entry_representation_market_depth", None
             )
@@ -426,29 +426,35 @@ class TrackedOrder:
             base["entry_representation_raw_top5"] = getattr(
                 self, "entry_representation_raw_top5", None
             )
+            base["entry_representation_diff_top5"] = getattr(
+                self, "entry_representation_diff_top5", None
+            )
 
             # Toxicity representation (shared across all modes)
             base["toxicity_representation"] = getattr(
                 self, "toxicity_representation", None
             )
 
-            # LOB sequences for all three modes
+            # LOB sequences for all four modes
             base["lob_sequence_market_depth"] = getattr(
                 self, "lob_sequence_market_depth", None
-            )
+            ) or None
             base["lob_sequence_moving_window"] = getattr(
                 self, "lob_sequence_moving_window", None
-            )
-            base["lob_sequence_raw_top5"] = getattr(self, "lob_sequence_raw_top5", None)
+            ) or None
+            base["lob_sequence_raw_top5"] = getattr(self, "lob_sequence_raw_top5", None) or None
+            base["lob_sequence_diff_top5"] = getattr(
+                self, "lob_sequence_diff_top5", None
+            ) or None
 
             # Toxicity sequence
-            base["toxicity_sequence"] = getattr(self, "toxicity_sequence", None)
+            base["toxicity_sequence"] = getattr(self, "toxicity_sequence", None) or None
 
             # Legacy fields (kept for backward compatibility)
             base["entry_representation"] = getattr(
                 self, "entry_representation_moving_window", None
             )
-            base["lob_sequence"] = getattr(self, "lob_sequence_moving_window", None)
+            base["lob_sequence"] = getattr(self, "lob_sequence_moving_window", None) or None
             base["sequence_length"] = len(
                 getattr(self, "lob_sequence_moving_window", []) or []
             )
@@ -489,6 +495,12 @@ class VirtualOrder(TrackedOrder):
     # Raw top-5 representation (20 dims: 5 bid levels * 2 + 5 ask levels * 2)
     entry_representation_raw_top5: list | None = None  # (T_hist, 20)
     lob_sequence_raw_top5: list[list[float]] = field(
+        default_factory=list
+    )  # (T_var, 20)
+
+    # Proportional difference top-5 representation (20 dims: 5 bid levels * 2 + 5 ask levels * 2)
+    entry_representation_diff_top5: list | None = None  # (T_hist, 20)
+    lob_sequence_diff_top5: list[list[float]] = field(
         default_factory=list
     )  # (T_var, 20)
 
@@ -563,6 +575,10 @@ class OrderTracker:
         time_censor_s: Optional maximum lifetime in seconds before an active
             order is censored as CENSORED_TIME. If None, no time censor is
             applied.
+        lookback_period: Number of historical snapshots to maintain in buffer.
+        snapshot_bin_messages: Number of messages between snapshots for LOB
+            representation sampling. Default is 10 messages per snapshot
+            (was 100 ms time-based in prior versions).
         representation_modes: List of LOB representation modes to include.
             Valid options: "market_depth", "moving_window", "raw_top5".
             If None, defaults to all three modes for backward compatibility.
@@ -577,7 +593,7 @@ class OrderTracker:
         representation_transform: BaseLOBTransform | None = None,
         include_representation: bool = True,
         lookback_period: int = 10,
-        snapshot_bin_s: float | None = None,
+        snapshot_bin_messages: int = 10,
         representation_modes: list[str] | None = None,
     ):
         self.market = Market()
@@ -629,15 +645,18 @@ class OrderTracker:
             if "raw_top5" in self.representation_modes
             else None
         )
+        self.representation_transform_diff_top5 = (
+            RepresentationTransform(representation="diff_top5")
+            if "diff_top5" in self.representation_modes
+            else None
+        )
 
         self.toxicity_features = ToxicityFeatures()
         self.include_representation = include_representation
 
         self.lookback_period = lookback_period
-        _bin_s = (
-            snapshot_bin_s if snapshot_bin_s is not None else CONFIG.features.interval_s
-        )
-        self._snapshot_bin_ns: int = int(_bin_s * 1e9)
+        self.snapshot_bin_messages = snapshot_bin_messages
+        self._message_count_since_snapshot: int = 0
         self._lob_snapshot_buffer: collections.deque = collections.deque(
             maxlen=lookback_period
         )
@@ -652,7 +671,7 @@ class OrderTracker:
             random_seed=random_seed,
             include_representation=include_representation,
             lookback_period=lookback_period,
-            snapshot_bin_s=_bin_s,
+            snapshot_bin_messages=snapshot_bin_messages,
             representation_modes=representation_modes,
         )
 
@@ -734,6 +753,7 @@ class OrderTracker:
                 "lob_sequence_moving_window",
             ],
             "raw_top5": ["entry_representation_raw_top5", "lob_sequence_raw_top5"],
+            "diff_top5": ["entry_representation_diff_top5", "lob_sequence_diff_top5"],
         }
 
         for mode, columns in rep_columns.items():
@@ -940,23 +960,25 @@ class OrderTracker:
         List[List[float]],
         List[List[float]],
         List[List[float]],
+        List[List[float]],
     ]:
         """Build variable-length historical sequences from the snapshot buffer for all modes.
 
         Returns:
             Tuple of (entry_market_depth, entry_moving_window, entry_raw_top5,
-                     toxicity_representation, unused_legacy)
+                     entry_diff_top5, toxicity_representation, unused_legacy)
         """
         if not self.include_representation:
-            return [], [], [], [], []
+            return [], [], [], [], [], []
 
         buf = list(self._lob_snapshot_buffer)
         if not buf:
-            return [], [], [], [], []
+            return [], [], [], [], [], []
 
         entry_market_depth: List[List[float]] = []
         entry_moving_window: List[List[float]] = []
         entry_raw_top5: List[List[float]] = []
+        entry_diff_top5: List[List[float]] = []
         toxicity_representation: List[List[float]] = []
 
         try:
@@ -996,6 +1018,18 @@ class OrderTracker:
                 )
                 entry_raw_top5 = rt_tensor.tolist()
 
+            # Proportional difference top-5 representation
+            if (
+                "diff_top5" in self.representation_modes
+                and self.representation_transform_diff_top5 is not None
+            ):
+                pt_tensor = self.representation_transform_diff_top5.transform_sequence_from_dicts(
+                    buf,
+                    self.lookback_period,
+                    pad_to_length=False,
+                )
+                entry_diff_top5 = pt_tensor.tolist()
+
             # Toxicity representation (shared across all modes)
             if self.toxicity_features is not None:
                 tox_tensor = self.toxicity_features.transform_sequence_from_dicts(
@@ -1008,26 +1042,42 @@ class OrderTracker:
         except Exception:
             pass
 
+        # Convert empty lists to None for consistent schema (avoid PyArrow type conflicts)
+        entry_market_depth = entry_market_depth if entry_market_depth else None
+        entry_moving_window = entry_moving_window if entry_moving_window else None
+        entry_raw_top5 = entry_raw_top5 if entry_raw_top5 else None
+        entry_diff_top5 = entry_diff_top5 if entry_diff_top5 else None
+        toxicity_representation = toxicity_representation if toxicity_representation else None
+
         return (
             entry_market_depth,
             entry_moving_window,
             entry_raw_top5,
+            entry_diff_top5,
             toxicity_representation,
             [],
         )
 
     def _append_snapshot_to_active_virtuals(
-        self, bids_snap: Dict[int, int], asks_snap: Dict[int, int]
+        self, bids_snap: Dict[int, int], asks_snap: Dict[int, int], ts_event: int
     ) -> None:
-        """Append one feature step to active orders for all representation modes."""
+        """Append one feature step to active orders for all representation modes.
+
+        Args:
+            bids_snap: Dict of bid prices to aggregate sizes.
+            asks_snap: Dict of ask prices to aggregate sizes.
+            ts_event: Timestamp in nanoseconds for time delta calculation.
+        """
         if not self.active_virtual or not self.include_representation:
             return
 
         lob_md_step: Optional[List[float]] = None  # market depth
         lob_mw_step: Optional[List[float]] = None  # moving window
         lob_rt_step: Optional[List[float]] = None  # raw top5
+        lob_dt_step: Optional[List[float]] = None  # diff top5
         tox_step: Optional[List[float]] = None
-        snapshot = [(bids_snap, asks_snap)]
+        # Include timestamp in snapshot for time delta computation
+        snapshot = [(bids_snap, asks_snap, ts_event)]
 
         # Market depth
         try:
@@ -1068,6 +1118,19 @@ class OrderTracker:
         except Exception:
             lob_rt_step = None
 
+        # Proportional difference top-5
+        try:
+            if self.representation_transform_diff_top5 is not None:
+                pt_tensor = self.representation_transform_diff_top5.transform_sequence_from_dicts(
+                    snapshot,
+                    n_lookback=1,
+                    pad_to_length=False,
+                )
+                if pt_tensor.shape[0] > 0:
+                    lob_dt_step = pt_tensor[-1].tolist()
+        except Exception:
+            lob_dt_step = None
+
         # Toxicity
         if self.toxicity_features is not None:
             try:
@@ -1088,6 +1151,8 @@ class OrderTracker:
                 v.lob_sequence_moving_window.append(list(lob_mw_step))
             if lob_rt_step is not None:
                 v.lob_sequence_raw_top5.append(list(lob_rt_step))
+            if lob_dt_step is not None:
+                v.lob_sequence_diff_top5.append(list(lob_dt_step))
             if tox_step is not None:
                 v.toxicity_sequence.append(
                     self.toxicity_features.augment_row_with_queue_position(
@@ -1111,6 +1176,7 @@ class OrderTracker:
                 entry_market_depth,
                 entry_moving_window,
                 entry_raw_top5,
+                entry_diff_top5,
                 toxicity_representation,
                 _,
             ) = self._get_entry_feature_sequences()
@@ -1137,7 +1203,7 @@ class OrderTracker:
 
             bid_toxicity_representation = (
                 self.toxicity_features.augment_rows_with_queue_position(
-                    toxicity_representation,
+                    toxicity_representation if toxicity_representation else [],
                     current_vahead,
                 )
             )
@@ -1164,20 +1230,30 @@ class OrderTracker:
                 entry_representation_raw_top5=(
                     entry_raw_top5 if "raw_top5" in self.representation_modes else None
                 ),
+                entry_representation_diff_top5=(
+                    entry_diff_top5
+                    if "diff_top5" in self.representation_modes
+                    else None
+                ),
                 toxicity_representation=bid_toxicity_representation,
                 lob_sequence_market_depth=(
                     [list(row) for row in entry_market_depth]
-                    if "market_depth" in self.representation_modes
+                    if "market_depth" in self.representation_modes and entry_market_depth
                     else []
                 ),
                 lob_sequence_moving_window=(
                     [list(row) for row in entry_moving_window]
-                    if "moving_window" in self.representation_modes
+                    if "moving_window" in self.representation_modes and entry_moving_window
                     else []
                 ),
                 lob_sequence_raw_top5=(
                     [list(row) for row in entry_raw_top5]
-                    if "raw_top5" in self.representation_modes
+                    if "raw_top5" in self.representation_modes and entry_raw_top5
+                    else []
+                ),
+                lob_sequence_diff_top5=(
+                    [list(row) for row in entry_diff_top5]
+                    if "diff_top5" in self.representation_modes and entry_diff_top5
                     else []
                 ),
                 lob_sequence=[],  # deprecated, kept for backward compat
@@ -1209,7 +1285,7 @@ class OrderTracker:
 
             ask_toxicity_representation = (
                 self.toxicity_features.augment_rows_with_queue_position(
-                    toxicity_representation,
+                    toxicity_representation if toxicity_representation else [],
                     current_vahead,
                 )
             )
@@ -1236,20 +1312,30 @@ class OrderTracker:
                 entry_representation_raw_top5=(
                     entry_raw_top5 if "raw_top5" in self.representation_modes else None
                 ),
+                entry_representation_diff_top5=(
+                    entry_diff_top5
+                    if "diff_top5" in self.representation_modes
+                    else None
+                ),
                 toxicity_representation=ask_toxicity_representation,
                 lob_sequence_market_depth=(
                     [list(row) for row in entry_market_depth]
-                    if "market_depth" in self.representation_modes
+                    if "market_depth" in self.representation_modes and entry_market_depth
                     else []
                 ),
                 lob_sequence_moving_window=(
                     [list(row) for row in entry_moving_window]
-                    if "moving_window" in self.representation_modes
+                    if "moving_window" in self.representation_modes and entry_moving_window
                     else []
                 ),
                 lob_sequence_raw_top5=(
                     [list(row) for row in entry_raw_top5]
-                    if "raw_top5" in self.representation_modes
+                    if "raw_top5" in self.representation_modes and entry_raw_top5
+                    else []
+                ),
+                lob_sequence_diff_top5=(
+                    [list(row) for row in entry_diff_top5]
+                    if "diff_top5" in self.representation_modes and entry_diff_top5
                     else []
                 ),
                 lob_sequence=[],  # deprecated, kept for backward compat
@@ -1387,7 +1473,21 @@ class OrderTracker:
                     "America/New_York"
                 )
                 day_start_dt = local_midnight + pd.Timedelta(hours=9, minutes=30)
-                day_end_dt = local_midnight + pd.Timedelta(hours=16, minutes=0)
+
+                # Check if this is an early closure day (1:00 PM ET close)
+                # These include Thanksgiving (Nov 28, 2025) and Christmas Eve (Dec 24, 2025)
+                if ts_dt.date() in (
+                    pd.Timestamp("2025-11-28").date(),
+                    pd.Timestamp("2025-12-24").date(),
+                ):
+                    day_end_dt = local_midnight + pd.Timedelta(
+                        hours=13, minutes=0
+                    )  # 1:00 PM ET
+                else:
+                    day_end_dt = local_midnight + pd.Timedelta(
+                        hours=16, minutes=0
+                    )  # 4:00 PM ET
+
                 day_start_ns = int(day_start_dt.tz_convert("UTC").value)
                 day_end_ns = int(day_end_dt.tz_convert("UTC").value)
                 local_date = ts_dt.date()
@@ -1413,6 +1513,7 @@ class OrderTracker:
 
                 current_local_date = local_date
                 current_day = msg_day
+                self._message_count_since_snapshot = 0  # Reset counter for new day
 
             # EARLY EXIT: Skip expensive operations for messages outside trading hours.
             # Still update market state for book continuity, but skip order tracking work.
@@ -1464,8 +1565,10 @@ class OrderTracker:
 
             self._move_scheduled_virtual_to_pending(day, mbo.ts_event)
 
+            # Increment message counter (only for in-hours messages)
+            self._message_count_since_snapshot += 1
             snapshot_due = (
-                mbo.ts_event - self._last_snapshot_ts >= self._snapshot_bin_ns
+                self._message_count_since_snapshot >= self.snapshot_bin_messages
             )
             if (
                 not self.active_virtual
@@ -1491,9 +1594,13 @@ class OrderTracker:
                 asks_snap = {
                     px: sum(o.size for o in lo.orders) for px, lo in book.offers.items()
                 }
-                self._lob_snapshot_buffer.append((bids_snap, asks_snap))
+                # Include timestamp in snapshot tuple for time delta calculation
+                self._lob_snapshot_buffer.append((bids_snap, asks_snap, mbo.ts_event))
                 self._last_snapshot_ts = mbo.ts_event
-                self._append_snapshot_to_active_virtuals(bids_snap, asks_snap)
+                self._message_count_since_snapshot = 0
+                self._append_snapshot_to_active_virtuals(
+                    bids_snap, asks_snap, mbo.ts_event
+                )
 
             out_buffer, parquet_writer = self._update_active_virtual(
                 mbo,

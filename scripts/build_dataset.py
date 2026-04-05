@@ -10,6 +10,20 @@ import pyarrow.parquet as pq
 
 # Ensure reproducible results across parallel runs
 # Must be set BEFORE importing numpy or spawning processes
+# pip install --break-system-packages -r requirements.txt
+"""
+# 1. Create a 16GB file for swap
+sudo fallocate -l 16G /swapfile
+
+# 2. Set the correct permissions
+sudo chmod 600 /swapfile
+
+# 3. Format the file as swap
+sudo mkswap /swapfile
+
+# 4. Enable the swap
+sudo swapon /swapfile
+"""
 if "PYTHONHASHSEED" not in os.environ:
     os.environ["PYTHONHASHSEED"] = "0"
 
@@ -28,20 +42,22 @@ from src.order_tracking import (
 from src.config import CONFIG
 
 SYMBOL = "AAPL"
-START_DATE = "2025-10-01"
-END_DATE = "2025-11-01"
+START_DATE = "2025-12-01"
+END_DATE = "2026-01-01"
 
 SAMPLES_PER_DAY = 1000
+# Interval is now message-based
+SNAPSHOT_BIN_MESSAGES = 10
 # Keep long-lived orders for dynamic models; disable fixed time censoring.
 TIME_CENSOR_S = None
-LOOKBACK_PERIOD = 200
+LOOKBACK_PERIOD = 500
 RANDOM_SEED = CONFIG.random_seed
 PROGRESS_INTERVAL = 100_000
 
 # LOB representation modes to include in dataset.
-# Valid options: "market_depth", "moving_window", "raw_top5"
+# Valid options: "market_depth", "moving_window", "raw_top5", "diff_top5"
 # Default: all three modes.
-REPRESENTATION_MODES = ["raw_top5"]
+REPRESENTATION_MODES = ["market_depth", "raw_top5", "diff_top5"]
 
 # Set to a "YYYY-MM-DD" string to restrict processing to a single trading day,
 # or None to process the entire file.
@@ -102,7 +118,7 @@ def main() -> None:
     global N_WORKERS
     if N_WORKERS is None:
         total_cores = multiprocessing.cpu_count()
-        N_WORKERS = max(1, total_cores - 2)
+        N_WORKERS = max(1, total_cores)
         print(
             f"Auto-selected {N_WORKERS} workers based on {total_cores} available cores."
         )
@@ -118,6 +134,7 @@ def main() -> None:
         time_censor_s=TIME_CENSOR_S,
         lookback_period=LOOKBACK_PERIOD,
         random_seed=RANDOM_SEED,
+        snapshot_bin_messages=SNAPSHOT_BIN_MESSAGES,
         representation_modes=REPRESENTATION_MODES,
     )
 
