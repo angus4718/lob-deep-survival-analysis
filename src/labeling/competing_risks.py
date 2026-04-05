@@ -15,6 +15,7 @@ from .base import BaseLabeler
 from ..domain.enums import EventType
 from ..config import CONFIG
 from .time_binning import UniformTimeBinner, LogTimeBinner
+from .utils import ms_to_suffix
 
 
 @dataclass
@@ -30,6 +31,7 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
     tox_spread_bps: float = None
     tox_duration_s: float = None
     binning_strategy: str = None
+    selected_window: int = None
 
     def __post_init__(self):
         if self.tox_bps is None:
@@ -107,8 +109,12 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
         duration_s = insertion_context.get("duration_s", 0.0)
         best_bid_at_entry = insertion_context.get("best_bid_at_entry")
         best_ask_at_entry = insertion_context.get("best_ask_at_entry")
-        best_bid_at_post_trade = insertion_context.get("best_bid_at_post_trade")
-        best_ask_at_post_trade = insertion_context.get("best_ask_at_post_trade")
+        if self.selected_window is None:
+            best_bid_at_post_trade = insertion_context.get("best_bid_at_post_trade")
+            best_ask_at_post_trade = insertion_context.get("best_ask_at_post_trade")
+        else:
+            best_bid_at_post_trade = insertion_context.get(f"post_trade_best_bid_{ms_to_suffix(self.selected_window)}")
+            best_ask_at_post_trade = insertion_context.get(f"post_trade_best_ask_{ms_to_suffix(self.selected_window)}")
 
         extra = {
             "post_trade_adverse_move_bps": None,

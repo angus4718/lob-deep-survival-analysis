@@ -7,6 +7,7 @@ avoid drift across datasets, models, and backtests.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Tuple
 
 
 @dataclass(frozen=True)
@@ -29,7 +30,8 @@ class LabelingConfig:
     tox_bps: float = 0.2  # bps, indicator of unfavorable fill
     tox_spread_bps: float = 0.2  # use for market condition checks
     tox_duration_s: float = 60
-    tox_post_trade_move_window_ms: int = 100
+    tox_post_trade_move_windows_ms: Tuple[int] = (1, 10, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 30000, 60000)
+    tox_markout_percentage_threshold: float = 0.9  # percentage of final markout to capture, max is 1 = 100%
     binning_strategy: str = "log"  # "uniform" or "log"
 
 

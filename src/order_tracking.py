@@ -35,6 +35,7 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 from .config import CONFIG
 from .labeling.base import BaseLabeler
 from .labeling.competing_risks import ExecutionCompetingRisksLabeler
+from .labeling.utils import ms_to_suffix
 from .features.base import BaseLOBTransform
 from .features.representation import RepresentationTransform
 from .features.compose import ToxicityFeatures, ComposeTransforms
@@ -406,6 +407,16 @@ class TrackedOrder:
                 self, "best_ask_at_post_trade", None
             )
 
+            # Raw data mode fields - post-trade BBO at each window
+            post_trade_windows = getattr(self, "post_trade_windows_ms", [])
+            raw_post_bbo = getattr(self, "raw_post_trade_bbo_list", None)
+
+            if post_trade_windows and raw_post_bbo:
+                for window_ms, (bid, ask) in zip(post_trade_windows, raw_post_bbo):
+                    suffix = ms_to_suffix(window_ms)
+                    base[f"post_trade_best_bid_{suffix}"] = bid
+                    base[f"post_trade_best_ask_{suffix}"] = ask
+
             # Three LOB representation modes
             base["entry_representation_market_depth"] = getattr(
                 self, "entry_representation_market_depth", None
@@ -464,6 +475,10 @@ class VirtualOrder(TrackedOrder):
     best_ask_at_post_trade: int = None
     post_trade_deadline_ts: Optional[int] = None
 
+    # Multiple post-trade capture windows (ms → ns conversion happens in OrderTracker)
+    post_trade_windows_ms: List[int] = field(default_factory=list)  # List of ms windows
+    post_trade_bbo_dict: Dict[int, tuple] = field(default_factory=dict)  # {ms: (bid, ask)}
+
     # Market-depth representation (41 dims)
     entry_representation_market_depth: Optional[List] = None  # (T_hist, 41)
     lob_sequence_market_depth: List[List[float]] = field(
@@ -491,6 +506,10 @@ class VirtualOrder(TrackedOrder):
         default_factory=list
     )  # (T_var, toxicity_dim)
 
+    raw_post_trade_bbo_list: List[tuple] = field(
+        default_factory=list
+    )  # List of (bid, ask) for each window
+
     def __post_init__(self):
         self.order_type = "VIRTUAL"
 
@@ -501,9 +520,10 @@ class VirtualOrder(TrackedOrder):
         # Fill when no volume is ahead
         if self.current_vahead <= 0:
             self.on_fill(mbo)
-            # Start post-trade context tracking using a time-based horizon.
+            # Initialize post_trade_windows_ms and setup tracking for multiple time windows
+            self.post_trade_windows_ms = list(CONFIG.labeling.tox_post_trade_move_windows_ms)
             self.post_trade_deadline_ts = mbo.ts_event + int(
-                CONFIG.labeling.tox_post_trade_move_window_ms * 1e6
+                max(self.post_trade_windows_ms) * 1e6
             )
             return
 
@@ -533,10 +553,27 @@ class VirtualOrder(TrackedOrder):
                     self.current_vahead -= diff
                     self.ids_ahead[mbo.order_id] = mbo.size
 
-    def record_post_trade_context(self, book: Book):
+    def record_post_trade_context(self, book: Book, elapsed_ms: Optional[int] = None):
+        """Record post-trade BBO at the current time.
+
+        Args:
+            book: The order book to extract BBO from.
+            elapsed_ms: Optional elapsed milliseconds since fill. If provided,
+                stores BBO in post_trade_bbo_dict for that window.
+        """
         b, a = book.bbo()
-        self.best_bid_at_post_trade = b.price if b else None
-        self.best_ask_at_post_trade = a.price if a else None
+        bid_price = b.price if b else None
+        ask_price = a.price if a else None
+
+        # update the legacy single post-trade fields (for backward compat)
+        if elapsed_ms is None or len(self.post_trade_windows_ms) <= 4 or elapsed_ms < self.post_trade_windows_ms[4]:
+            self.best_bid_at_post_trade = bid_price
+            self.best_ask_at_post_trade = ask_price
+
+        # Store in the dict for this specific window if elapsed_ms is provided
+        if elapsed_ms is not None:
+            self.post_trade_bbo_dict[elapsed_ms] = (bid_price, ask_price)
+            self.raw_post_trade_bbo_list.append((bid_price, ask_price))
 
 
 @dataclass
@@ -565,6 +602,7 @@ class OrderTracker:
         include_representation: bool = True,
         lookback_period: int = 10,
         snapshot_bin_s: Optional[float] = None,
+        raw_data_mode: bool = False,
     ):
         self.market = Market()
         self.active_virtual: List[VirtualOrder] = []
@@ -585,7 +623,8 @@ class OrderTracker:
         self.virtual_sample_index: Dict[int, int] = {}
         self.pending_virtual: Dict[int, List[int]] = {}
 
-        self.labeler = labeler or ExecutionCompetingRisksLabeler()
+        self.raw_data_mode = raw_data_mode
+        self.labeler = None if raw_data_mode else (labeler or ExecutionCompetingRisksLabeler())
 
         # Create three separate representation transforms for all modes
         self.representation_transform = (
@@ -624,6 +663,7 @@ class OrderTracker:
             include_representation=include_representation,
             lookback_period=lookback_period,
             snapshot_bin_s=_bin_s,
+            raw_data_mode=raw_data_mode,
         )
 
     def _apply_labeling(self, record: Dict[str, Any]) -> Dict[str, Any]:
@@ -847,14 +887,38 @@ class OrderTracker:
     def _update_post_trade_virtual(
         self, mbo, book, out_buffer, parquet_writer, parquet_batch_size, output_parquet
     ):
-        """Update post-trade virtuals and capture BBO once the time horizon is reached."""
+        """Update post-trade virtuals and capture BBO at each configured time window.
+
+        For each post-trade virtual order, checks if any of the configured windows
+        have been reached (e.g., 1ms, 10ms, 50ms, etc.). Records the market BBO at
+        each reached window, and finalizes the order once all windows are captured.
+        """
         next_post_trade_virtual = []
         for v in self.post_trade_virtual:
-            if (
-                v.post_trade_deadline_ts is not None
-                and mbo.ts_event >= v.post_trade_deadline_ts
-            ):
-                v.record_post_trade_context(book)
+            fill_time = v.end_time
+            elapsed_ns = mbo.ts_event - fill_time
+            elapsed_ms = elapsed_ns / 1e6
+
+            # Check if we have any unrecorded windows that have now passed
+            windows_to_record = []
+            for window_ms in v.post_trade_windows_ms:
+                if window_ms not in v.post_trade_bbo_dict and elapsed_ms >= window_ms:
+                    windows_to_record.append(window_ms)
+
+            # Record BBO for each newly-passed window
+            for window_ms in windows_to_record:
+                v.record_post_trade_context(book, elapsed_ms=int(window_ms))
+
+            # Check if all windows have been recorded or if we've exceeded the max deadline
+            is_complete = (
+                len(v.post_trade_bbo_dict) == len(v.post_trade_windows_ms)
+                or (v.post_trade_deadline_ts is not None and mbo.ts_event >= v.post_trade_deadline_ts)
+            )
+
+            if is_complete:
+                # Ensure we have recorded at least the first window's BBO
+                if not v.post_trade_bbo_dict and book is not None:
+                    v.record_post_trade_context(book, elapsed_ms=int(v.post_trade_windows_ms[0]) if v.post_trade_windows_ms else 1)
                 out_buffer, parquet_writer = self._append_completed_order(
                     out_buffer,
                     parquet_writer,
