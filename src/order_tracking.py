@@ -34,8 +34,6 @@ from .lob_implementation import Market, Book
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 from .config import CONFIG
-from .labeling.base import BaseLabeler
-from .labeling.competing_risks import ExecutionCompetingRisksLabeler
 from .labeling.utils import ms_to_suffix
 from .features.base import BaseLOBTransform
 from .features.representation import RepresentationTransform
@@ -630,13 +628,11 @@ class OrderTracker:
         samples_per_day: int = 100,
         time_censor_s: float | None = None,
         random_seed: int | None = CONFIG.random_seed,
-        labeler: BaseLabeler | None = None,
         representation_transform: BaseLOBTransform | None = None,
         include_representation: bool = True,
         lookback_period: int = 10,
         snapshot_bin_messages: int = 10,
         representation_modes: list[str] | None = None,
-        raw_data_mode: bool = False,
     ):
         self.market = Market()
         self.active_virtual: list[VirtualOrder] = []
@@ -655,11 +651,6 @@ class OrderTracker:
         self.virtual_sample_schedule: dict[int, list[int]] = {}
         self.virtual_sample_index: dict[int, int] = {}
         self.pending_virtual: dict[int, list[int]] = {}
-
-        self.raw_data_mode = raw_data_mode
-        self.labeler = (
-            None if raw_data_mode else (labeler or ExecutionCompetingRisksLabeler())
-        )
 
         # Set default representation modes if not specified (backward compatible)
         if representation_modes is None:
@@ -713,38 +704,14 @@ class OrderTracker:
             lookback_period=lookback_period,
             snapshot_bin_messages=snapshot_bin_messages,
             representation_modes=representation_modes,
-            raw_data_mode=raw_data_mode,
         )
-
-    def _apply_labeling(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        """Apply configured labeler to a completed order record."""
-        if self.labeler is None:
-            return record
-        try:
-            result = self.labeler.label(record)
-        except Exception:
-            return record
-
-        event_type = result.get("event_type")
-        if event_type is not None:
-            try:
-                record["event_type"] = int(event_type)
-            except Exception:
-                record["event_type"] = event_type
-        record["event_time_bin"] = result.get("event_time_bin")
-
-        extras = result.get("extras", {}) or {}
-        if isinstance(extras, dict):
-            record.update(extras)
-        return record
 
     def _append_completed_order(
         self, out_buffer, parquet_writer, output_parquet, parquet_batch_size, order
     ):
-        """Serialize, label, append, and maybe flush one completed order."""
+        """Serialize, append, and maybe flush one completed order."""
         self._enforce_time_censor_horizon(order)
         record = order.to_dict()
-        record = self._apply_labeling(record)
         out_buffer.append(record)
         out_buffer, parquet_writer = self._maybe_flush(
             out_buffer, parquet_writer, output_parquet, parquet_batch_size

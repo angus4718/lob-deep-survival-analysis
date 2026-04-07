@@ -1,7 +1,9 @@
 import os
 import sys
+import math
 from types import SimpleNamespace
 from pathlib import Path
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 # Ensure project root is in sys.path for src imports
@@ -9,7 +11,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.order_tracking import OrderTracker, VirtualOrder
+from src.order_tracking import (
+    OrderTracker,
+    VirtualOrder,
+    _prepare_output_path,
+    _select_split_points,
+    _select_split_points_by_message_count,
+)
+import src.order_tracking as order_tracking
 
 
 class DummyLevel:
@@ -145,6 +154,36 @@ def test_update_active_virtual_fill_and_censor():
     assert len(out_buffer) == 1
     rec = out_buffer[0]
     assert rec["status_reason"].startswith("CENSORED")
+    assert abs(rec["duration_s"] - 1.0) < 1e-12
+
+
+def test_late_fill_is_converted_to_time_censor():
+    tr = OrderTracker(samples_per_day=1, time_censor_s=1.0)
+    # current_vahead == 0 makes this virtual fill immediately on update.
+    # The update timestamp is beyond the censor horizon, so it must be censored.
+    v = VirtualOrder(
+        internal_id=30,
+        entry_time=0,
+        price=100,
+        side="B",
+        current_vahead=0,
+        ids_ahead={},
+    )
+    tr.active_virtual = [v]
+    mbo = DummyMBO(ts_event=int(2 * 1e9))
+    out_buffer = []
+    parquet_writer = None
+
+    out_buffer, parquet_writer = tr._update_active_virtual(
+        mbo, DummyBook(), out_buffer, parquet_writer, 10, "out.parquet"
+    )
+
+    assert len(tr.post_trade_virtual) == 0
+    assert len(out_buffer) == 1
+    rec = out_buffer[0]
+    assert rec["status_reason"] == "CENSORED_TIME"
+    assert rec["event"] == 0
+    assert abs(rec["duration_s"] - 1.0) < 1e-12
 
 
 def test_virtual_update_unknown_id_no_change():
@@ -227,6 +266,15 @@ def test_init_day_schedule_with_zero_samples_creates_one():
     tr._init_day_schedule(day, 0, 1_000_000_000, samples_per_day=0)
     assert day in tr.virtual_sample_schedule
     assert len(tr.virtual_sample_schedule[day]) >= 1
+
+
+def test_prepare_output_path_creates_parent_directory(tmp_path):
+    target = tmp_path / "nested" / "chunk_000.parquet"
+
+    prepared = Path(_prepare_output_path(str(target)))
+
+    assert prepared == target.resolve()
+    assert prepared.parent.is_dir()
 
 
 def test_spawn_fallback_to_best_size_when_level_empty():
@@ -332,6 +380,11 @@ def test_time_censor_ns_conversion():
     assert tr.time_censor_ns == int(2.5 * 1e9)
 
 
+def test_default_tracker_disables_time_censor():
+    tr = OrderTracker()
+    assert tr.time_censor_ns is None
+
+
 def test_trackedorder_to_dict_fields():
     # Verify to_dict emits expected keys and volume heuristic
     v = VirtualOrder(
@@ -348,7 +401,7 @@ def test_trackedorder_to_dict_fields():
 
 
 def test_spawn_uses_sequence_entry_representation():
-    tr = OrderTracker(samples_per_day=1, representation_context_events=5)
+    tr = OrderTracker(samples_per_day=1, lookback_period=5)
     day = 12
     tr.pending_virtual[day] = [999]
 
@@ -358,18 +411,25 @@ def test_spawn_uses_sequence_entry_representation():
     best_bid = SimpleNamespace(price=100, size=8)
     best_ask = SimpleNamespace(price=101, size=6)
 
-    key = (1, 1)
+    # Manually populate snapshot buffer with 3 snapshots
     for _ in range(3):
-        tr._update_book_history(key, book)
+        bids_snap = {100: 8}
+        asks_snap = {101: 6}
+        tr._lob_snapshot_buffer.append((bids_snap, asks_snap))
 
-    tr._spawn_virtuals_for_pending(day, book, best_bid, best_ask, key)
+    tr._spawn_virtuals_for_pending(day, book, best_bid, best_ask)
 
     assert len(tr.active_virtual) >= 2
-    sample_repr = tr.active_virtual[-1].entry_representation
+    sample_repr = tr.active_virtual[-1].entry_representation_moving_window
     assert sample_repr is not None
     assert isinstance(sample_repr, list)
     assert len(sample_repr) == 3
     assert isinstance(sample_repr[0], list)
+
+    # Dynamic sequences are initialized from available history with no padding.
+    sample_seq = tr.active_virtual[-1].lob_sequence_moving_window
+    assert isinstance(sample_seq, list)
+    assert len(sample_seq) == 3
 
 
 def test_maybe_flush_writes_parquet(tmp_path):
@@ -385,3 +445,381 @@ def test_maybe_flush_writes_parquet(tmp_path):
     assert parquet_writer is not None
     parquet_writer.close()
     assert os.path.exists(parquet_path)
+
+
+def test_spawn_appends_queue_position_to_toxicity_features():
+    tr = OrderTracker(samples_per_day=1, lookback_period=5)
+    day = 13
+    tr.pending_virtual[day] = [111]
+
+    bid_level = DummyLevel(orders=[(11, 5), (12, 3)])
+    ask_level = DummyLevel(orders=[(21, 2), (22, 4)])
+    book = DummyBook(bids={100: bid_level}, offers={101: ask_level})
+    best_bid = SimpleNamespace(price=100, size=8)
+    best_ask = SimpleNamespace(price=101, size=6)
+
+    for _ in range(3):
+        tr._lob_snapshot_buffer.append(({100: 8}, {101: 6}))
+
+    tr._spawn_virtuals_for_pending(day, book, best_bid, best_ask)
+
+    v_bid = tr.active_virtual[-2]
+    v_ask = tr.active_virtual[-1]
+
+    assert v_bid.toxicity_representation
+    assert v_ask.toxicity_representation
+
+    expected_bid_qp = math.log1p(float(v_bid.current_vahead))
+    expected_ask_qp = math.log1p(float(v_ask.current_vahead))
+
+    assert all(row[-1] == expected_bid_qp for row in v_bid.toxicity_representation)
+    assert all(row[-1] == expected_ask_qp for row in v_ask.toxicity_representation)
+
+    assert all(row[-1] == expected_bid_qp for row in v_bid.toxicity_sequence)
+    assert all(row[-1] == expected_ask_qp for row in v_ask.toxicity_sequence)
+
+
+def test_append_snapshot_uses_each_order_queue_position_in_toxicity_sequence():
+    tr = OrderTracker(samples_per_day=1)
+    v_bid = VirtualOrder(
+        internal_id=40,
+        entry_time=0,
+        price=100,
+        side="B",
+        current_vahead=7,
+        ids_ahead={},
+    )
+    v_ask = VirtualOrder(
+        internal_id=41,
+        entry_time=0,
+        price=101,
+        side="A",
+        current_vahead=2,
+        ids_ahead={},
+    )
+    tr.active_virtual = [v_bid, v_ask]
+
+    tr._append_snapshot_to_active_virtuals({100: 10}, {101: 9}, ts_event=1)
+
+    assert len(v_bid.toxicity_sequence) == 1
+    assert len(v_ask.toxicity_sequence) == 1
+    assert v_bid.toxicity_sequence[0][-1] == math.log1p(7.0)
+    assert v_ask.toxicity_sequence[0][-1] == math.log1p(2.0)
+
+
+def test_select_split_points_by_message_count_prefers_balanced_boundaries():
+    # 4 candidate empty points produce 5 message segments.
+    # For 3 workers, ideal cumulative boundaries are around 40 and 80.
+    empty_points = [10, 20, 30, 40]
+    messages_between_splits = [5, 35, 35, 20, 5]
+
+    split_ts = _select_split_points_by_message_count(
+        empty_points=empty_points,
+        messages_between_splits=messages_between_splits,
+        n=3,
+    )
+
+    # cumulative at empty points: [5, 40, 75, 95], so closest picks are 20 and 30
+    assert split_ts == [20, 30]
+
+
+def test_select_split_points_by_message_count_falls_back_on_mismatch():
+    empty_points = [100, 200, 300, 400]
+    # Invalid length should trigger fallback to time-based selector.
+    invalid_counts = [1, 2]
+
+    from_fallback = _select_split_points(empty_points, 3)
+    from_message_count = _select_split_points_by_message_count(
+        empty_points=empty_points,
+        messages_between_splits=invalid_counts,
+        n=3,
+    )
+
+    assert from_message_count == from_fallback
+
+
+def test_filter_record_by_representation_modes_removes_unselected_columns():
+    tr = OrderTracker(representation_modes=["moving_window", "raw_top5"])
+    record = {
+        "entry_representation_market_depth": [[1.0]],
+        "lob_sequence_market_depth": [[1.0]],
+        "entry_representation_moving_window": [[2.0]],
+        "lob_sequence_moving_window": [[2.0]],
+        "entry_representation_raw_top5": [[3.0]],
+        "lob_sequence_raw_top5": [[3.0]],
+        "entry_representation_diff_top5": [[4.0]],
+        "lob_sequence_diff_top5": [[4.0]],
+    }
+
+    filtered = tr._filter_record_by_representation_modes(record)
+
+    assert "entry_representation_market_depth" not in filtered
+    assert "lob_sequence_market_depth" not in filtered
+    assert "entry_representation_diff_top5" not in filtered
+    assert "lob_sequence_diff_top5" not in filtered
+    assert "entry_representation_moving_window" in filtered
+    assert "lob_sequence_moving_window" in filtered
+    assert "entry_representation_raw_top5" in filtered
+    assert "lob_sequence_raw_top5" in filtered
+
+
+def test_enforce_time_censor_horizon_clips_completed_order():
+    tr = OrderTracker(time_censor_s=1.0)
+    v = VirtualOrder(
+        internal_id=55,
+        entry_time=0,
+        price=100,
+        side="B",
+        current_vahead=0,
+        ids_ahead={},
+    )
+    v.status = "FILLED"
+    v.end_time = int(2e9)
+
+    clipped = tr._enforce_time_censor_horizon(v)
+
+    assert clipped is True
+    assert v.status == "CENSORED_TIME"
+    assert v.end_time == int(1e9)
+
+
+class _ImmediateFuture:
+    def __init__(self, fn, args):
+        self._result = fn(args)
+
+    def result(self):
+        return self._result
+
+
+class _ImmediateExecutor:
+    def __init__(self, max_workers=None):
+        self.max_workers = max_workers
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    def submit(self, fn, args):
+        return _ImmediateFuture(fn, args)
+
+
+def _write_synthetic_chunk(output_parquet, ts_start, ts_end, seed, rows):
+    selected = []
+    for row in rows:
+        ts_event = row["ts_event"]
+        if ts_start is not None and ts_event < ts_start:
+            continue
+        if ts_end is not None and ts_event >= ts_end:
+            continue
+        selected.append(
+            {
+                "row_id": int(row["row_id"]),
+                "ts_event": int(ts_event),
+                "seed": int(seed),
+            }
+        )
+
+    schema = pa.schema(
+        [
+            ("row_id", pa.int64()),
+            ("ts_event", pa.int64()),
+            ("seed", pa.int64()),
+        ]
+    )
+    table = pa.Table.from_pylist(selected, schema=schema)
+    pq.write_table(table, output_parquet)
+
+
+def test_parallel_output_matches_single_process_under_fixed_seed(tmp_path, monkeypatch):
+    synthetic_rows = [
+        {"row_id": 1, "ts_event": 10},
+        {"row_id": 2, "ts_event": 20},
+        {"row_id": 3, "ts_event": 30},
+        {"row_id": 4, "ts_event": 40},
+        {"row_id": 5, "ts_event": 50},
+        {"row_id": 6, "ts_event": 60},
+        {"row_id": 7, "ts_event": 70},
+    ]
+
+    def _fake_chunk_worker(kwargs):
+        output_parquet = kwargs["output_parquet"]
+        chunk_ts_start = kwargs.get("chunk_ts_start")
+        chunk_ts_end = kwargs.get("chunk_ts_end")
+        seed = kwargs.get("tracker_kwargs", {}).get("random_seed", -1)
+        _write_synthetic_chunk(
+            output_parquet=output_parquet,
+            ts_start=chunk_ts_start,
+            ts_end=chunk_ts_end,
+            seed=seed,
+            rows=synthetic_rows,
+        )
+        return {
+            "chunk_idx": kwargs["chunk_idx"],
+            "output_parquet": output_parquet,
+            "scheduled_virtual": 0,
+            "spawned_virtual": 0,
+        }
+
+    monkeypatch.setattr(order_tracking, "_chunk_worker", _fake_chunk_worker)
+    monkeypatch.setattr(order_tracking, "ProcessPoolExecutor", _ImmediateExecutor)
+    monkeypatch.setattr(order_tracking, "as_completed", lambda futures: futures)
+
+    fixed_seed = 2026
+    single_out = tmp_path / "single.parquet"
+    parallel_out = tmp_path / "parallel.parquet"
+
+    _write_synthetic_chunk(
+        output_parquet=str(single_out),
+        ts_start=None,
+        ts_end=None,
+        seed=fixed_seed,
+        rows=synthetic_rows,
+    )
+
+    tracker = OrderTracker(random_seed=fixed_seed)
+    tracker.process_stream_parallel(
+        file_path="unused.dbn.zst",
+        output_parquet=str(parallel_out),
+        n_workers=3,
+        empty_points=[30, 60],
+        empty_scan_verbose=False,
+    )
+
+    single_rows = pq.read_table(single_out).to_pylist()
+    parallel_rows = pq.read_table(parallel_out).to_pylist()
+    assert parallel_rows == single_rows
+
+
+def test_parallel_output_is_repeatable_with_fixed_seed(tmp_path, monkeypatch):
+    synthetic_rows = [
+        {"row_id": 11, "ts_event": 10},
+        {"row_id": 12, "ts_event": 20},
+        {"row_id": 13, "ts_event": 30},
+        {"row_id": 14, "ts_event": 40},
+        {"row_id": 15, "ts_event": 50},
+    ]
+
+    def _fake_chunk_worker(kwargs):
+        output_parquet = kwargs["output_parquet"]
+        chunk_ts_start = kwargs.get("chunk_ts_start")
+        chunk_ts_end = kwargs.get("chunk_ts_end")
+        seed = kwargs.get("tracker_kwargs", {}).get("random_seed", -1)
+        _write_synthetic_chunk(
+            output_parquet=output_parquet,
+            ts_start=chunk_ts_start,
+            ts_end=chunk_ts_end,
+            seed=seed,
+            rows=synthetic_rows,
+        )
+        return {
+            "chunk_idx": kwargs["chunk_idx"],
+            "output_parquet": output_parquet,
+            "scheduled_virtual": 0,
+            "spawned_virtual": 0,
+        }
+
+    monkeypatch.setattr(order_tracking, "_chunk_worker", _fake_chunk_worker)
+    monkeypatch.setattr(order_tracking, "ProcessPoolExecutor", _ImmediateExecutor)
+    monkeypatch.setattr(order_tracking, "as_completed", lambda futures: futures)
+
+    fixed_seed = 12345
+    first_out = tmp_path / "parallel_first.parquet"
+    second_out = tmp_path / "parallel_second.parquet"
+
+    tracker_a = OrderTracker(random_seed=fixed_seed)
+    tracker_b = OrderTracker(random_seed=fixed_seed)
+
+    tracker_a.process_stream_parallel(
+        file_path="unused.dbn.zst",
+        output_parquet=str(first_out),
+        n_workers=2,
+        empty_points=[30],
+        empty_scan_verbose=False,
+    )
+    tracker_b.process_stream_parallel(
+        file_path="unused.dbn.zst",
+        output_parquet=str(second_out),
+        n_workers=2,
+        empty_points=[30],
+        empty_scan_verbose=False,
+    )
+
+    first_rows = pq.read_table(first_out).to_pylist()
+    second_rows = pq.read_table(second_out).to_pylist()
+    assert first_rows == second_rows
+
+
+def test_parallel_worker_count_invariance_schema_and_row_order(tmp_path, monkeypatch):
+    synthetic_rows = [
+        {"row_id": 101, "ts_event": 10},
+        {"row_id": 102, "ts_event": 20},
+        {"row_id": 103, "ts_event": 30},
+        {"row_id": 104, "ts_event": 40},
+        {"row_id": 105, "ts_event": 50},
+        {"row_id": 106, "ts_event": 60},
+        {"row_id": 107, "ts_event": 70},
+        {"row_id": 108, "ts_event": 80},
+    ]
+
+    def _fake_chunk_worker(kwargs):
+        output_parquet = kwargs["output_parquet"]
+        chunk_ts_start = kwargs.get("chunk_ts_start")
+        chunk_ts_end = kwargs.get("chunk_ts_end")
+        seed = kwargs.get("tracker_kwargs", {}).get("random_seed", -1)
+        _write_synthetic_chunk(
+            output_parquet=output_parquet,
+            ts_start=chunk_ts_start,
+            ts_end=chunk_ts_end,
+            seed=seed,
+            rows=synthetic_rows,
+        )
+        return {
+            "chunk_idx": kwargs["chunk_idx"],
+            "output_parquet": output_parquet,
+            "scheduled_virtual": 0,
+            "spawned_virtual": 0,
+        }
+
+    monkeypatch.setattr(order_tracking, "_chunk_worker", _fake_chunk_worker)
+    monkeypatch.setattr(order_tracking, "ProcessPoolExecutor", _ImmediateExecutor)
+    monkeypatch.setattr(order_tracking, "as_completed", lambda futures: futures)
+
+    fixed_seed = 999
+    out_2_workers = tmp_path / "parallel_2_workers.parquet"
+    out_4_workers = tmp_path / "parallel_4_workers.parquet"
+
+    tracker_2 = OrderTracker(random_seed=fixed_seed)
+    tracker_4 = OrderTracker(random_seed=fixed_seed)
+
+    # Empty-market points define legal split boundaries.
+    # Running with 2 vs 4 workers exercises different chunking layouts.
+    empty_points = [30, 50, 70]
+
+    tracker_2.process_stream_parallel(
+        file_path="unused.dbn.zst",
+        output_parquet=str(out_2_workers),
+        n_workers=2,
+        empty_points=empty_points,
+        empty_scan_verbose=False,
+    )
+    tracker_4.process_stream_parallel(
+        file_path="unused.dbn.zst",
+        output_parquet=str(out_4_workers),
+        n_workers=4,
+        empty_points=empty_points,
+        empty_scan_verbose=False,
+    )
+
+    table_2 = pq.read_table(out_2_workers)
+    table_4 = pq.read_table(out_4_workers)
+
+    assert table_2.schema == table_4.schema
+
+    rows_2 = table_2.to_pylist()
+    rows_4 = table_4.to_pylist()
+    assert rows_2 == rows_4
+
+    # Explicit row-order check for readability in failures.
+    assert [r["row_id"] for r in rows_2] == [r["row_id"] for r in rows_4]

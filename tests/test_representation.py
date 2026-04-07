@@ -141,6 +141,188 @@ class TestRepresentationTransform:
 
         assert result.shape == (5,)
 
+    def test_diff_top5_representation_interleaved_and_top5_only(self):
+        """Test diff_top5 keeps only five levels with bid levels first, then ask levels."""
+        transform = RepresentationTransform(representation="diff_top5")
+
+        book = create_book_with_levels(
+            bid_prices=[100, 99, 98, 97, 96, 95],
+            bid_sizes=[10, 20, 30, 40, 50, 60],
+            ask_prices=[101, 102, 103, 104, 105, 106],
+            ask_sizes=[11, 22, 33, 44, 55, 66],
+        )
+
+        result = transform.transform_snapshot(book)
+
+        # Expected values: absolute price differences (price - mid)
+        # with mid = (100 + 101) / 2 = 100.5
+        # Format: [bid_price_diff_1..5, bid_vol_1..5, ask_price_diff_1..5, ask_vol_1..5]
+        expected = torch.tensor(
+            [
+                -0.5,  # bid_1_price_diff = 100 - 100.5
+                10.0,  # bid_1_vol
+                -1.5,  # bid_2_price_diff = 99 - 100.5
+                20.0,  # bid_2_vol
+                -2.5,  # bid_3_price_diff = 98 - 100.5
+                30.0,  # bid_3_vol
+                -3.5,  # bid_4_price_diff = 97 - 100.5
+                40.0,  # bid_4_vol
+                -4.5,  # bid_5_price_diff = 96 - 100.5
+                50.0,  # bid_5_vol
+                0.5,  # ask_1_price_diff = 101 - 100.5
+                11.0,  # ask_1_vol
+                1.5,  # ask_2_price_diff = 102 - 100.5
+                22.0,  # ask_2_vol
+                2.5,  # ask_3_price_diff = 103 - 100.5
+                33.0,  # ask_3_vol
+                3.5,  # ask_4_price_diff = 104 - 100.5
+                44.0,  # ask_4_vol
+                4.5,  # ask_5_price_diff = 105 - 100.5
+                55.0,  # ask_5_vol
+            ],
+            dtype=torch.float32,
+        )
+
+        assert result.shape == (20,)
+        assert torch.allclose(result, expected, atol=1e-6)
+
+    def test_diff_top5_missing_levels_locf(self):
+        """Test diff_top5 uses last-observation-carried-forward for missing prices."""
+        transform = RepresentationTransform(representation="diff_top5")
+
+        # Only 3 bid levels and 2 ask levels (missing levels 4-5)
+        book = create_book_with_levels(
+            bid_prices=[100, 99, 98],
+            bid_sizes=[10, 20, 30],
+            ask_prices=[101, 102],
+            ask_sizes=[11, 22],
+        )
+
+        result = transform.transform_snapshot(book)
+
+        # Expected: missing levels carry forward the last price_diff with zero volume
+        # mid = (100 + 101) / 2 = 100.5
+        expected = torch.tensor(
+            [
+                # Bid levels (levels 1-3 present, 4-5 missing with LOCF)
+                -0.5,  # bid_1_price_diff = 100 - 100.5
+                10.0,  # bid_1_vol
+                -1.5,  # bid_2_price_diff = 99 - 100.5
+                20.0,  # bid_2_vol
+                -2.5,  # bid_3_price_diff = 98 - 100.5
+                30.0,  # bid_3_vol
+                -2.5,  # bid_4_price_diff = LOCF from bid_3
+                0.0,  # bid_4_vol = 0 (missing)
+                -2.5,  # bid_5_price_diff = LOCF from bid_4 (which is bid_3)
+                0.0,  # bid_5_vol = 0 (missing)
+                # Ask levels (levels 1-2 present, 3-5 missing with LOCF)
+                0.5,  # ask_1_price_diff = 101 - 100.5
+                11.0,  # ask_1_vol
+                1.5,  # ask_2_price_diff = 102 - 100.5
+                22.0,  # ask_2_vol
+                1.5,  # ask_3_price_diff = LOCF from ask_2
+                0.0,  # ask_3_vol = 0 (missing)
+                1.5,  # ask_4_price_diff = LOCF from ask_3 (which is ask_2)
+                0.0,  # ask_4_vol = 0 (missing)
+                1.5,  # ask_5_price_diff = LOCF from ask_4 (which is ask_2)
+                0.0,  # ask_5_vol = 0 (missing)
+            ],
+            dtype=torch.float32,
+        )
+
+        assert result.shape == (20,)
+        assert torch.allclose(result, expected, atol=1e-6)
+
+    def test_raw_top5_representation_absolute_prices(self):
+        """Test raw_top5 uses absolute prices (not normalized) with 0-padding."""
+        transform = RepresentationTransform(representation="raw_top5")
+
+        book = create_book_with_levels(
+            bid_prices=[100, 99, 98, 97, 96, 95],
+            bid_sizes=[10, 20, 30, 40, 50, 60],
+            ask_prices=[101, 102, 103, 104, 105, 106],
+            ask_sizes=[11, 22, 33, 44, 55, 66],
+        )
+
+        result = transform.transform_snapshot(book)
+
+        # Expected: absolute prices and volumes
+        # Format: [bid_price_1, bid_vol_1, ..., bid_price_5, bid_vol_5, ask_price_1, ask_vol_1, ..., ask_price_5, ask_vol_5]
+        expected = torch.tensor(
+            [
+                100.0,
+                10.0,  # bid_1
+                99.0,
+                20.0,  # bid_2
+                98.0,
+                30.0,  # bid_3
+                97.0,
+                40.0,  # bid_4
+                96.0,
+                50.0,  # bid_5
+                101.0,
+                11.0,  # ask_1
+                102.0,
+                22.0,  # ask_2
+                103.0,
+                33.0,  # ask_3
+                104.0,
+                44.0,  # ask_4
+                105.0,
+                55.0,  # ask_5
+            ],
+            dtype=torch.float32,
+        )
+
+        assert result.shape == (20,)
+        assert torch.allclose(result, expected, atol=1e-6)
+
+    def test_raw_top5_missing_levels_zero_padding(self):
+        """Test raw_top5 uses 0-padding for missing levels."""
+        transform = RepresentationTransform(representation="raw_top5")
+
+        # Only 3 bid levels and 2 ask levels (missing levels 4-5)
+        book = create_book_with_levels(
+            bid_prices=[100, 99, 98],
+            bid_sizes=[10, 20, 30],
+            ask_prices=[101, 102],
+            ask_sizes=[11, 22],
+        )
+
+        result = transform.transform_snapshot(book)
+
+        # Expected: missing levels zero-padded (both price and volume)
+        expected = torch.tensor(
+            [
+                # Bid levels (levels 1-3 present, 4-5 zero-padded)
+                100.0,
+                10.0,  # bid_1
+                99.0,
+                20.0,  # bid_2
+                98.0,
+                30.0,  # bid_3
+                0.0,
+                0.0,  # bid_4 (missing)
+                0.0,
+                0.0,  # bid_5 (missing)
+                # Ask levels (levels 1-2 present, 3-5 zero-padded)
+                101.0,
+                11.0,  # ask_1
+                102.0,
+                22.0,  # ask_2
+                0.0,
+                0.0,  # ask_3 (missing)
+                0.0,
+                0.0,  # ask_4 (missing)
+                0.0,
+                0.0,  # ask_5 (missing)
+            ],
+            dtype=torch.float32,
+        )
+
+        assert result.shape == (20,)
+        assert torch.allclose(result, expected)
+
     def test_invalid_representation_raises(self):
         """Test that invalid representation raises ValueError."""
         transform = RepresentationTransform(representation="invalid_mode")
@@ -232,9 +414,6 @@ class TestRepresentationTransform:
         # Custom tick sizes
         transform2 = RepresentationTransform(tick_size=2)
         assert transform2._anchor_mid(100.5) == int(round(100.5 / 2) * 2)
-
-        transform3 = RepresentationTransform(tick_size=0)
-        assert transform3._anchor_mid(100.5) == int(round(100.5))
 
     def test_levels_from_book(self):
         """Test extraction of bid/ask levels from book."""

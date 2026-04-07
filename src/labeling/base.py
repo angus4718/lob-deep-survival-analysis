@@ -17,11 +17,3 @@ class BaseLabeler(ABC):
             dict with keys: event_type, event_time_bin, extras
         """
         pass
-
-
-class BaseTimeBinner(ABC):
-	@abstractmethod
-	def bin_time(self, delta_seconds: float) -> int:
-		"""Return the time bin index for a given duration in seconds."""
-		pass
-
