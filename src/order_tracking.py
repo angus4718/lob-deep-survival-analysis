@@ -832,8 +832,12 @@ class OrderTracker:
             out_buffer = []
         return out_buffer, parquet_writer
 
-    def _init_day_schedule(self, day, day_start_ns, day_end_ns, samples_per_day):
-        """Create deterministic per-day schedules if not already present."""
+    def _init_day_schedule(self, day, day_start_ns, on_close_start_ns, samples_per_day):
+        """Create deterministic per-day schedules if not already present.
+
+        Samples are scheduled uniformly between day_start_ns and on_close_start_ns
+        (10:00 AM - 3:30 PM ET).
+        """
         if day in self.virtual_sample_schedule:
             return
         self.samples_per_day = samples_per_day
@@ -844,14 +848,15 @@ class OrderTracker:
         # Derive day-specific RNG from stable inputs so schedules are invariant
         # to worker count and chunk execution order.
         seed_material = (
-            f"{self.random_seed}|{day}|{day_start_ns}|{day_end_ns}|{samples_per_day}"
+            f"{self.random_seed}|{day}|{day_start_ns}|{on_close_start_ns}|{samples_per_day}"
         ).encode("ascii")
         day_seed = int.from_bytes(
             hashlib.sha256(seed_material).digest()[:8], "big", signed=False
         )
         day_rng = random.Random(day_seed)
         v_times = sorted(
-            int(day_rng.uniform(day_start_ns, day_end_ns)) for _ in range(v_count)
+            int(day_rng.uniform(day_start_ns, on_close_start_ns))
+            for _ in range(v_count)
         )
 
         # In chunked mode, keep only samples whose timestamps belong to this chunk.
@@ -1572,23 +1577,28 @@ class OrderTracker:
                 local_midnight = pd.Timestamp(ts_dt.date()).tz_localize(
                     "America/New_York"
                 )
-                day_start_dt = local_midnight + pd.Timedelta(hours=9, minutes=30)
+                day_start_dt = local_midnight + pd.Timedelta(hours=10, minutes=0)
 
-                # Check if this is an early closure day (1:00 PM ET close)
-                # These include Thanksgiving (Nov 28, 2025) and Christmas Eve (Dec 24, 2025)
-                if ts_dt.date() in (
+                # Skip early closure days entirely (no sampling)
+                is_early_close = ts_dt.date() in (
                     pd.Timestamp("2025-11-28").date(),
                     pd.Timestamp("2025-12-24").date(),
-                ):
-                    day_end_dt = local_midnight + pd.Timedelta(
-                        hours=13, minutes=0
-                    )  # 1:00 PM ET
+                )
+                if is_early_close:
+                    day_end_dt = (
+                        local_midnight  # Set to midnight to skip this day entirely
+                    )
+                    on_close_start_dt = local_midnight
                 else:
                     day_end_dt = local_midnight + pd.Timedelta(
                         hours=16, minutes=0
-                    )  # 4:00 PM ET
+                    )  # 4:00 PM ET (full trading day)
+                    on_close_start_dt = local_midnight + pd.Timedelta(
+                        hours=15, minutes=30
+                    )  # 3:30 PM ET (sampling cutoff)
 
                 day_start_ns = int(day_start_dt.tz_convert("UTC").value)
+                on_close_start_ns = int(on_close_start_dt.tz_convert("UTC").value)
                 day_end_ns = int(day_end_dt.tz_convert("UTC").value)
                 local_date = ts_dt.date()
 
@@ -1661,7 +1671,9 @@ class OrderTracker:
 
             day = local_date
 
-            self._init_day_schedule(day, day_start_ns, day_end_ns, samples_per_day)
+            self._init_day_schedule(
+                day, day_start_ns, on_close_start_ns, samples_per_day
+            )
 
             self._move_scheduled_virtual_to_pending(day, mbo.ts_event)
 

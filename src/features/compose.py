@@ -7,6 +7,7 @@ Feature transforms for toxicity modeling and transform composition.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Sequence, List, Dict
 
 import torch
@@ -28,12 +29,17 @@ class ToxicityFeatures(BaseLOBTransform):
     n_levels: int = 5  # Number of price levels to consider
 
     @staticmethod
-    def queue_position_feature(current_vahead: Any) -> float:
-        """Convert queue-ahead volume into a non-negative scalar feature."""
+    def _safe_log1p_non_negative(value: Any) -> float:
+        """Apply log1p to a scalar after clamping at zero."""
         try:
-            return float(max(int(current_vahead), 0))
+            return float(math.log1p(max(float(value), 0.0)))
         except Exception:
             return 0.0
+
+    @staticmethod
+    def queue_position_feature(current_vahead: Any) -> float:
+        """Convert queue-ahead volume into a log-scaled non-negative feature."""
+        return ToxicityFeatures._safe_log1p_non_negative(current_vahead)
 
     def augment_row_with_queue_position(
         self,
@@ -77,8 +83,9 @@ class ToxicityFeatures(BaseLOBTransform):
 
         # 1. SPREAD (1 feature)
         spread_abs = best_ask - best_bid
-        spread_bps = (spread_abs / mid) * 10000 if mid > 0 else 0
-        features.extend([spread_bps])
+        spread_relative = (spread_abs / mid) if mid > 0 else 0
+        spread_relative = self._safe_log1p_non_negative(spread_relative)
+        features.extend([spread_relative])
 
         # 2. TOP-OF-BOOK IMBALANCE (1 feature)
         bid_size_tob = bids.get(best_bid, 0)
@@ -125,6 +132,7 @@ class ToxicityFeatures(BaseLOBTransform):
         else:
             weighted_imbalance = 0.0
 
+        total_weighted = self._safe_log1p_non_negative(total_weighted)
         features.extend([weighted_imbalance, total_weighted])
 
         # 5. LIQUIDITY CONCENTRATION (2 features)
@@ -147,11 +155,11 @@ class ToxicityFeatures(BaseLOBTransform):
         # 6. MICROPRICE DEVIATION (1 feature)
         if total_tob > 0:
             microprice = (best_bid * ask_size_tob + best_ask * bid_size_tob) / total_tob
-            microprice_offset_bps = ((microprice - mid) / mid) * 10000 if mid > 0 else 0
+            microprice_offset = ((microprice - mid) / mid) if mid > 0 else 0
         else:
-            microprice_offset_bps = 0.0
+            microprice_offset = 0.0
 
-        features.append(microprice_offset_bps)
+        features.append(microprice_offset)
 
         # 7. BOOK SHAPE (2 features: count of significant levels on each side)
         threshold = 0.1 * total_depth if total_depth > 0 else 0
@@ -196,6 +204,7 @@ class ToxicityFeatures(BaseLOBTransform):
                 time_delta_ms = (ts - prev_ts) / 1e6  # ns to ms
             else:
                 time_delta_ms = 0.0
+            time_delta_ms = self._safe_log1p_non_negative(time_delta_ms)
             prev_ts = ts
 
             features = self._extract_features_from_dicts(bids_dict, asks_dict)
@@ -231,7 +240,7 @@ class ToxicityFeatures(BaseLOBTransform):
 
     def _feature_dim(self) -> int:
         """Return the dimensionality of the feature vector."""
-        # 1 (spread_bps) + 1 (imbalance_tob) + 1 (depth_imbalance)
+        # 1 (spread_relative) + 1 (imbalance_tob) + 1 (depth_imbalance)
         # + 2 (weighted terms) + 2 (concentration terms)
         # + 1 (microprice offset) + 2 (book shape) = 10
         return 10
@@ -239,14 +248,14 @@ class ToxicityFeatures(BaseLOBTransform):
     def get_feature_names(self) -> List[str]:
         """Return human-readable names for each feature."""
         return [
-            "spread_bps",
+            "spread_relative",
             "imbalance_tob",
             "depth_imbalance",
             "weighted_imbalance",
             "total_weighted_volume",
             "tob_concentration",
             "volume_cv",
-            "microprice_offset_bps",
+            "microprice_offset",
             "significant_bid_levels",
             "significant_ask_levels",
             "time_delta_ms",
