@@ -167,7 +167,6 @@ def main() -> None:
             tracker.process_stream(
                 file_path=str(dbn_path),
                 output_parquet=str(output_path),
-                limit=None,
                 progress_interval=PROGRESS_INTERVAL,
                 samples_per_day=SAMPLES_PER_DAY,
                 target_day=TARGET_DAY,

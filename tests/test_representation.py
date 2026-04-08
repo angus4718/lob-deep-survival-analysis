@@ -142,7 +142,7 @@ class TestRepresentationTransform:
         assert result.shape == (5,)
 
     def test_diff_top5_representation_interleaved_and_top5_only(self):
-        """Test diff_top5 keeps only five levels with bid levels first, then ask levels."""
+        """Test diff_top5 keeps only five levels with ask/bid interleaving."""
         transform = RepresentationTransform(representation="diff_top5")
 
         book = create_book_with_levels(
@@ -156,29 +156,29 @@ class TestRepresentationTransform:
 
         # Expected values: absolute price differences (price - mid)
         # with mid = (100 + 101) / 2 = 100.5
-        # Format: [bid_price_diff_1..5, bid_vol_1..5, ask_price_diff_1..5, ask_vol_1..5]
+        # Format: [ask_price_diff_1, ask_vol_1, bid_price_diff_1, bid_vol_1, ...]
         expected = torch.tensor(
             [
-                -0.5,  # bid_1_price_diff = 100 - 100.5
-                10.0,  # bid_1_vol
-                -1.5,  # bid_2_price_diff = 99 - 100.5
-                20.0,  # bid_2_vol
-                -2.5,  # bid_3_price_diff = 98 - 100.5
-                30.0,  # bid_3_vol
-                -3.5,  # bid_4_price_diff = 97 - 100.5
-                40.0,  # bid_4_vol
-                -4.5,  # bid_5_price_diff = 96 - 100.5
-                50.0,  # bid_5_vol
                 0.5,  # ask_1_price_diff = 101 - 100.5
                 11.0,  # ask_1_vol
+                -0.5,  # bid_1_price_diff = 100 - 100.5
+                10.0,  # bid_1_vol
                 1.5,  # ask_2_price_diff = 102 - 100.5
                 22.0,  # ask_2_vol
+                -1.5,  # bid_2_price_diff = 99 - 100.5
+                20.0,  # bid_2_vol
                 2.5,  # ask_3_price_diff = 103 - 100.5
                 33.0,  # ask_3_vol
+                -2.5,  # bid_3_price_diff = 98 - 100.5
+                30.0,  # bid_3_vol
                 3.5,  # ask_4_price_diff = 104 - 100.5
                 44.0,  # ask_4_vol
+                -3.5,  # bid_4_price_diff = 97 - 100.5
+                40.0,  # bid_4_vol
                 4.5,  # ask_5_price_diff = 105 - 100.5
                 55.0,  # ask_5_vol
+                -4.5,  # bid_5_price_diff = 96 - 100.5
+                50.0,  # bid_5_vol
             ],
             dtype=torch.float32,
         )
@@ -204,28 +204,30 @@ class TestRepresentationTransform:
         # mid = (100 + 101) / 2 = 100.5
         expected = torch.tensor(
             [
-                # Bid levels (levels 1-3 present, 4-5 missing with LOCF)
-                -0.5,  # bid_1_price_diff = 100 - 100.5
-                10.0,  # bid_1_vol
-                -1.5,  # bid_2_price_diff = 99 - 100.5
-                20.0,  # bid_2_vol
-                -2.5,  # bid_3_price_diff = 98 - 100.5
-                30.0,  # bid_3_vol
-                -2.5,  # bid_4_price_diff = LOCF from bid_3
-                0.0,  # bid_4_vol = 0 (missing)
-                -2.5,  # bid_5_price_diff = LOCF from bid_4 (which is bid_3)
-                0.0,  # bid_5_vol = 0 (missing)
-                # Ask levels (levels 1-2 present, 3-5 missing with LOCF)
+                # Level 1: ask then bid
                 0.5,  # ask_1_price_diff = 101 - 100.5
                 11.0,  # ask_1_vol
+                -0.5,  # bid_1_price_diff = 100 - 100.5
+                10.0,  # bid_1_vol
+                # Level 2: ask then bid
                 1.5,  # ask_2_price_diff = 102 - 100.5
                 22.0,  # ask_2_vol
+                -1.5,  # bid_2_price_diff = 99 - 100.5
+                20.0,  # bid_2_vol
+                # Level 3: ask missing (LOCF), bid present
                 1.5,  # ask_3_price_diff = LOCF from ask_2
                 0.0,  # ask_3_vol = 0 (missing)
+                -2.5,  # bid_3_price_diff = 98 - 100.5
+                30.0,  # bid_3_vol
+                # Levels 4-5: both missing with side-specific LOCF
                 1.5,  # ask_4_price_diff = LOCF from ask_3 (which is ask_2)
                 0.0,  # ask_4_vol = 0 (missing)
+                -2.5,  # bid_4_price_diff = LOCF from bid_3
+                0.0,  # bid_4_vol = 0 (missing)
                 1.5,  # ask_5_price_diff = LOCF from ask_4 (which is ask_2)
                 0.0,  # ask_5_vol = 0 (missing)
+                -2.5,  # bid_5_price_diff = LOCF from bid_4
+                0.0,  # bid_5_vol = 0 (missing)
             ],
             dtype=torch.float32,
         )
@@ -247,29 +249,29 @@ class TestRepresentationTransform:
         result = transform.transform_snapshot(book)
 
         # Expected: absolute prices and volumes
-        # Format: [bid_price_1, bid_vol_1, ..., bid_price_5, bid_vol_5, ask_price_1, ask_vol_1, ..., ask_price_5, ask_vol_5]
+        # Format: [ask_price_1, ask_vol_1, bid_price_1, bid_vol_1, ...]
         expected = torch.tensor(
             [
-                100.0,
-                10.0,  # bid_1
-                99.0,
-                20.0,  # bid_2
-                98.0,
-                30.0,  # bid_3
-                97.0,
-                40.0,  # bid_4
-                96.0,
-                50.0,  # bid_5
                 101.0,
                 11.0,  # ask_1
+                100.0,
+                10.0,  # bid_1
                 102.0,
                 22.0,  # ask_2
+                99.0,
+                20.0,  # bid_2
                 103.0,
                 33.0,  # ask_3
+                98.0,
+                30.0,  # bid_3
                 104.0,
                 44.0,  # ask_4
+                97.0,
+                40.0,  # bid_4
                 105.0,
                 55.0,  # ask_5
+                96.0,
+                50.0,  # bid_5
             ],
             dtype=torch.float32,
         )
@@ -294,28 +296,30 @@ class TestRepresentationTransform:
         # Expected: missing levels zero-padded (both price and volume)
         expected = torch.tensor(
             [
-                # Bid levels (levels 1-3 present, 4-5 zero-padded)
-                100.0,
-                10.0,  # bid_1
-                99.0,
-                20.0,  # bid_2
-                98.0,
-                30.0,  # bid_3
-                0.0,
-                0.0,  # bid_4 (missing)
-                0.0,
-                0.0,  # bid_5 (missing)
-                # Ask levels (levels 1-2 present, 3-5 zero-padded)
+                # Level 1: ask then bid
                 101.0,
                 11.0,  # ask_1
+                100.0,
+                10.0,  # bid_1
+                # Level 2: ask then bid
                 102.0,
                 22.0,  # ask_2
+                99.0,
+                20.0,  # bid_2
+                # Level 3: ask missing then bid present
                 0.0,
                 0.0,  # ask_3 (missing)
+                98.0,
+                30.0,  # bid_3
+                # Levels 4-5: both sides missing
                 0.0,
                 0.0,  # ask_4 (missing)
                 0.0,
+                0.0,  # bid_4 (missing)
+                0.0,
                 0.0,  # ask_5 (missing)
+                0.0,
+                0.0,  # bid_5 (missing)
             ],
             dtype=torch.float32,
         )

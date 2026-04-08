@@ -1,5 +1,5 @@
 """
-ExecutionCompetingRisksLabeler: Assigns event type and time bin for each simulated order.
+ExecutionCompetingRisksLabeler: Assigns competing-risks event type for each simulated order.
 
 - 0: CENSORED
 - 1: FAVORABLE_FILL
@@ -86,9 +86,9 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
         - Toxicity threshold: dynamic half-spread at fill time
 
         Threshold Selection:
-        1. Preferred: use post-trade BBO as proxy for execution-time spread
+        1. Preferred: use execution-time BBO captured at fill time
         2. Fallback: use entry-time BBO only for ultra-fast fills (duration < 100ms)
-        3. Invalid: long resting orders without execution-time spread → CENSORED (cannot label reliably)
+        3. Invalid: if none of the above are available, CENSORED
 
         Missing Data: If critical fields are None (execution_price, entry BBO), mark as CENSORED.
         Rationale: entry spread is irrelevant for orders resting > 100ms; using stale market
@@ -100,6 +100,8 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
         duration_s = insertion_context.get("duration_s", 0.0)
         best_bid_at_entry = insertion_context.get("best_bid_at_entry")
         best_ask_at_entry = insertion_context.get("best_ask_at_entry")
+        best_bid_at_execution = insertion_context.get("best_bid_at_execution")
+        best_ask_at_execution = insertion_context.get("best_ask_at_execution")
 
         if self.selected_window is None:
             best_bid_at_post_trade = insertion_context.get("best_bid_at_post_trade")
@@ -132,28 +134,31 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
             return EventType.CENSORED, extra
 
         # === DETERMINE SPREAD THRESHOLD ===
-        # Threshold 1 (Preferred): post-trade spread as proxy for execution-time spread
-        if best_bid_at_post_trade is not None and best_ask_at_post_trade is not None:
-            post_trade_half_spread = (
-                best_ask_at_post_trade - best_bid_at_post_trade
+        # Threshold 1 (Preferred): execution-time spread captured at fill timestamp
+        if best_bid_at_execution is not None and best_ask_at_execution is not None:
+            execution_half_spread = (
+                best_ask_at_execution - best_bid_at_execution
             ) / 2.0
-            threshold_bps = (post_trade_half_spread / execution_price) * 10000
-            extra["spread_source"] = "execution (post_trade_proxy)"
-            extra["post_trade_recorded"] = True
+            threshold_bps = (execution_half_spread / execution_price) * 10000
+            extra["spread_source"] = "execution"
             extra["spread_threshold_bps"] = threshold_bps
-            post_trade_mid = (best_bid_at_post_trade + best_ask_at_post_trade) / 2.0
         # Threshold 2 (Fallback): entry spread only for ultra-fast fills (< 100ms)
         elif duration_s < 0.1:
             entry_half_spread = (best_ask_at_entry - best_bid_at_entry) / 2.0
             threshold_bps = (entry_half_spread / execution_price) * 10000
             extra["spread_source"] = "entry (ultra-fast, duration < 100ms)"
-            extra["post_trade_recorded"] = False
             extra["spread_threshold_bps"] = threshold_bps
-            # Use entry mid as proxy (not ideal, but only fallback for very fast fills)
-            post_trade_mid = (best_bid_at_entry + best_ask_at_entry) / 2.0
-        # Threshold 3 (Invalid): long resting orders without execution-time spread
+        # Threshold 3 (Invalid): long resting orders without a valid spread source
         else:
-            # Cannot label: entry spread is stale market history for 100ms+ resting orders
+            extra["labeling_valid"] = False
+            return EventType.CENSORED, extra
+
+        # Require post-trade BBO for adverse move computation.
+        # If market reaction cannot be observed, do not impute.
+        if best_bid_at_post_trade is not None and best_ask_at_post_trade is not None:
+            post_trade_mid = (best_bid_at_post_trade + best_ask_at_post_trade) / 2.0
+            extra["post_trade_recorded"] = True
+        else:
             extra["labeling_valid"] = False
             extra["post_trade_recorded"] = False
             return EventType.CENSORED, extra

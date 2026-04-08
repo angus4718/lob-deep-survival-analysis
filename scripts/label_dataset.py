@@ -156,6 +156,8 @@ def label_dataset_adaptive_toxic_window(
             "side": row.get("side"),
             "best_bid_at_entry": row.get("best_bid_at_entry"),
             "best_ask_at_entry": row.get("best_ask_at_entry"),
+            "best_bid_at_execution": row.get("best_bid_at_execution"),
+            "best_ask_at_execution": row.get("best_ask_at_execution"),
         }
 
         # Add post-trade BBO fields (legacy single window)

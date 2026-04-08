@@ -35,20 +35,33 @@ from .lob_implementation import Market, Book
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 from .config import CONFIG
 from .labeling.utils import ms_to_suffix
-from .features.base import BaseLOBTransform
 from .features.representation import RepresentationTransform
-from .features.compose import ToxicityFeatures, ComposeTransforms
+from .features.compose import ToxicityFeatures
 
 
 def _prepare_output_path(path: str) -> str:
-    """Return a normalized absolute output path and ensure its parent exists."""
+    """Normalize an output path and ensure its parent directory exists.
+
+    Args:
+        path: Output path to normalize.
+
+    Returns:
+        Normalized absolute path.
+    """
     output_path = Path(path).expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     return str(output_path.resolve())
 
 
 def _market_is_empty(market: Market) -> bool:
-    """Return True iff every book in the market has no resting orders."""
+    """Return whether every book in the market has no resting orders.
+
+    Args:
+        market: Market instance to inspect.
+
+    Returns:
+        True if no resting orders remain in any book, otherwise False.
+    """
     for pub_books in market.books.values():
         for book in pub_books.values():
             if book.bids or book.offers or book.orders_by_id:
@@ -58,12 +71,12 @@ def _market_is_empty(market: Market) -> bool:
 
 def find_empty_market_points(file_path: str, verbose: bool = True) -> list[int]:
     """
-    Scan a DBN file in a single pass and return a sorted list of
-    ``ts_event`` values (nanoseconds) at which the aggregated order book
-    transitions from *non-empty* to completely *empty*.
+    Scan a DBN file and return empty-market transition timestamps.
 
-    These timestamps are safe split-points for parallel processing because
-    each chunk can start with a clean (empty) book state.
+    The function returns the nanosecond ``ts_event`` values at which the
+    aggregated order book transitions from non-empty to completely empty.
+    These timestamps are safe split points for parallel processing because
+    each chunk can start with a clean book state.
 
     Args:
         file_path: Path to the DBN or DBN.ZST file.
@@ -112,12 +125,9 @@ def count_messages_between_split_points(
     verbose: bool = True,
 ) -> tuple[list[int], int]:
     """
-    Count messages in each segment induced by ``split_points``.
+    Count messages in each segment induced by split points.
 
-    Segment definition matches chunk guards used by ``process_stream``:
-    - Segment 0: ``ts_event < split_points[0]``
-    - Segment i: ``split_points[i-1] <= ts_event < split_points[i]``
-    - Last segment: ``ts_event >= split_points[-1]``
+    Segment boundaries match the chunk guards used by ``process_stream``.
 
     Args:
         file_path: Path to DBN or DBN.ZST file.
@@ -125,7 +135,7 @@ def count_messages_between_split_points(
         verbose: Print progress while counting.
 
     Returns:
-        Tuple of ``(messages_between_splits, total_messages)`` where
+        A tuple of ``(messages_between_splits, total_messages)`` where
         ``messages_between_splits`` has length ``len(split_points) + 1``.
     """
     data = db.DBNStore.from_file(file_path)
@@ -158,7 +168,11 @@ def count_messages_between_split_points(
 
 def analyze_empty_market_splits(file_path: str, verbose: bool = True) -> dict:
     """
-    Compute split metadata for progress accounting and cache it.
+    Compute and return split metadata for progress accounting.
+
+    Args:
+        file_path: Path to the DBN file to scan.
+        verbose: Print progress while scanning and counting.
 
     Returns a dict containing:
     - ``split_points``: empty-market split timestamps.
@@ -180,17 +194,15 @@ def analyze_empty_market_splits(file_path: str, verbose: bool = True) -> dict:
 
 def _select_split_points(empty_points: list[int], n: int) -> list[int]:
     """
-    Choose ``n - 1`` timestamps from *empty_points* that divide the
-    timeline ``[empty_points[0], empty_points[-1]]`` into *n* roughly
-    equal segments.
+    Choose split timestamps that divide the timeline into roughly equal segments.
 
     Args:
         empty_points: Sorted list of empty-market timestamps (ns).
         n: Desired number of chunks.
 
     Returns:
-        Sorted list of ``n - 1`` split timestamps (may be fewer if there
-        are not enough distinct empty points).
+        Sorted list of split timestamps. The list may contain fewer than
+        ``n - 1`` entries if there are not enough distinct empty points.
     """
     if n <= 1 or not empty_points:
         return []
@@ -211,9 +223,7 @@ def _select_split_points_by_message_count(
     n: int,
 ) -> list[int]:
     """
-    Choose ``n - 1`` timestamps from *empty_points* that divide the
-    data into *n* chunks with roughly equal message counts, while ensuring
-    each chunk starts at an empty-market point.
+    Choose split timestamps that balance message counts across chunks.
 
     Args:
         empty_points: Sorted list of empty-market timestamps (ns).
@@ -224,8 +234,8 @@ def _select_split_points_by_message_count(
         n: Desired number of chunks.
 
     Returns:
-        Sorted list of ``n - 1`` split timestamps that start empty-market
-        transitions and balance message counts across chunks.
+        Sorted list of split timestamps that start empty-market transitions
+        and balance message counts across chunks.
     """
     if n <= 1 or not empty_points:
         return []
@@ -258,17 +268,17 @@ def _select_split_points_by_message_count(
 
 def _chunk_worker(kwargs: dict) -> dict:
     """
-    Module-level worker function executed by ``ProcessPoolExecutor``.
+    Run one parallel chunk in a worker process.
 
-    Instantiates a fresh :class:`OrderTracker`, processes one time-slice
+    Instantiates a fresh :class:`OrderTracker`, processes one time slice
     of the DBN file, and writes results to a temporary Parquet file.
 
     Args:
         kwargs: Dict produced by :meth:`OrderTracker.process_stream_parallel`.
 
     Returns:
-        Dict with keys ``output_parquet``, ``scheduled_virtual``,
-        ``spawned_virtual``.
+        Dictionary with keys ``chunk_idx``, ``output_parquet``,
+        ``scheduled_virtual``, and ``spawned_virtual``.
     """
     import sys
 
@@ -342,28 +352,52 @@ class TrackedOrder:
     order_type: str = "UNKNOWN"
 
     def is_active(self) -> bool:
-        """Return True if order is still active (not filled/censored)."""
+        """Return whether the order is still active.
+
+        Returns:
+            True if the order has not yet been filled or censored,
+            otherwise False.
+        """
         return self.status == "ACTIVE"
 
     def on_fill(self, mbo: db.MBOMsg):
-        """Mark the order as filled using the given MBO message timestamp."""
+        """Mark the order as filled.
+
+        Args:
+            mbo: MBO message providing the fill timestamp.
+        """
         self.status = "FILLED"
         self.end_time = mbo.ts_event
 
     def on_censor(self, reason: str, mbo: db.MBOMsg | None = None):
-        """Mark the order as censored for the given reason."""
+        """Mark the order as censored.
+
+        Args:
+            reason: Censoring reason string.
+            mbo: Optional MBO message providing the censor timestamp.
+        """
         self.status = reason
         self.end_time = mbo.ts_event if mbo is not None else self.end_time
 
     def update(self, mbo: db.MBOMsg, book: Book, market: Market):
         """Update order state in response to an MBO message.
 
-        Subclasses must implement this method.
+        Args:
+            mbo: Incoming MBO message.
+            book: Current book state.
+            market: Current market state.
+
+        Raises:
+            NotImplementedError: Subclasses must implement this method.
         """
         raise NotImplementedError()
 
     def to_dict(self) -> dict:
-        """Return a serializable dict representing the tracked order record."""
+        """Serialize the tracked order into a dictionary.
+
+        Returns:
+            Dictionary representation of the tracked order record.
+        """
         duration_ns = self.end_time - self.entry_time
         event = 1 if self.status == "FILLED" else 0
         side_val = getattr(self.side, "value", self.side)
@@ -400,6 +434,8 @@ class TrackedOrder:
         if isinstance(self, VirtualOrder):
             base["best_bid_at_entry"] = getattr(self, "best_bid_at_entry", None)
             base["best_ask_at_entry"] = getattr(self, "best_ask_at_entry", None)
+            base["best_bid_at_execution"] = getattr(self, "best_bid_at_execution", None)
+            base["best_ask_at_execution"] = getattr(self, "best_ask_at_execution", None)
             base["best_bid_at_post_trade"] = getattr(
                 self, "best_bid_at_post_trade", None
             )
@@ -481,6 +517,8 @@ class VirtualOrder(TrackedOrder):
     ids_ahead: dict[int, int] = field(default_factory=dict)
     best_bid_at_entry: int | None = None
     best_ask_at_entry: int | None = None
+    best_bid_at_execution: int | None = None
+    best_ask_at_execution: int | None = None
     best_bid_at_post_trade: int | None = None
     best_ask_at_post_trade: int | None = None
     post_trade_deadline_ts: int | None = None
@@ -531,20 +569,29 @@ class VirtualOrder(TrackedOrder):
     def __post_init__(self):
         self.order_type = "VIRTUAL"
 
+    def _fill_and_init_post_trade(self, mbo: db.MBOMsg, book: Book) -> None:
+        """Mark as filled and initialize post-trade tracking windows."""
+        b, a = book.bbo()
+        self.best_bid_at_execution = b.price if b else None
+        self.best_ask_at_execution = a.price if a else None
+        self.on_fill(mbo)
+        self.post_trade_windows_ms = list(
+            CONFIG.labeling.tox_post_trade_move_windows_ms
+        )
+        if self.post_trade_windows_ms:
+            self.post_trade_deadline_ts = mbo.ts_event + int(
+                max(self.post_trade_windows_ms) * 1e6
+            )
+        else:
+            self.post_trade_deadline_ts = mbo.ts_event
+
     def update(self, mbo: db.MBOMsg, book: Book, market: Market):
         if not self.is_active():
             return
 
         # Fill when no volume is ahead
         if self.current_vahead <= 0:
-            self.on_fill(mbo)
-            # Initialize post_trade_windows_ms and setup tracking for multiple time windows
-            self.post_trade_windows_ms = list(
-                CONFIG.labeling.tox_post_trade_move_windows_ms
-            )
-            self.post_trade_deadline_ts = mbo.ts_event + int(
-                max(self.post_trade_windows_ms) * 1e6
-            )
+            self._fill_and_init_post_trade(mbo, book)
             return
 
         # Adjust volume ahead in response to cancels/fills/modifies
@@ -573,13 +620,17 @@ class VirtualOrder(TrackedOrder):
                     self.current_vahead -= diff
                     self.ids_ahead[mbo.order_id] = mbo.size
 
+        # Re-check after queue updates so depletion by this message fills immediately.
+        if self.current_vahead <= 0:
+            self._fill_and_init_post_trade(mbo, book)
+
     def record_post_trade_context(self, book: Book, elapsed_ms: Optional[int] = None):
         """Record post-trade BBO at the current time.
 
         Args:
-            book: The order book to extract BBO from.
-            elapsed_ms: Optional elapsed milliseconds since fill. If provided,
-                stores BBO in post_trade_bbo_dict for that window.
+            book: Order book used to extract the BBO.
+            elapsed_ms: Optional elapsed milliseconds since fill. When
+                provided, the BBO is stored for that specific window.
         """
         b, a = book.bbo()
         bid_price = b.price if b else None
@@ -628,7 +679,6 @@ class OrderTracker:
         samples_per_day: int = 100,
         time_censor_s: float | None = None,
         random_seed: int | None = CONFIG.random_seed,
-        representation_transform: BaseLOBTransform | None = None,
         include_representation: bool = True,
         lookback_period: int = 10,
         snapshot_bin_messages: int = 10,
@@ -637,9 +687,6 @@ class OrderTracker:
         self.market = Market()
         self.active_virtual: list[VirtualOrder] = []
         self.post_trade_virtual: list[VirtualOrder] = []
-        self.completed: list[TrackedOrder] = []
-
-        self.last_sample_time = 0
         self.virtual_oid_counter = 0
 
         self.time_censor_ns: int | None = (
@@ -658,9 +705,6 @@ class OrderTracker:
         self.representation_modes = set(representation_modes)
 
         # Create three separate representation transforms for all modes
-        self.representation_transform = (
-            representation_transform or RepresentationTransform()
-        )
         self.representation_transform_market_depth = (
             RepresentationTransform(representation="market_depth")
             if "market_depth" in self.representation_modes
@@ -691,7 +735,6 @@ class OrderTracker:
         self._lob_snapshot_buffer: collections.deque = collections.deque(
             maxlen=lookback_period
         )
-        self._last_snapshot_ts: int = 0
 
         self.inst = Instrumentation()
 
@@ -709,7 +752,18 @@ class OrderTracker:
     def _append_completed_order(
         self, out_buffer, parquet_writer, output_parquet, parquet_batch_size, order
     ):
-        """Serialize, append, and maybe flush one completed order."""
+        """Serialize one completed order and append it to the write buffer.
+
+        Args:
+            out_buffer: Pending output records.
+            parquet_writer: Active Parquet writer, if any.
+            output_parquet: Output file path.
+            parquet_batch_size: Buffer size threshold for flushing.
+            order: Completed order to serialize.
+
+        Returns:
+            Updated ``(out_buffer, parquet_writer)`` tuple.
+        """
         self._enforce_time_censor_horizon(order)
         record = order.to_dict()
         out_buffer.append(record)
@@ -720,7 +774,10 @@ class OrderTracker:
 
     def _enforce_time_censor_horizon(self, order: TrackedOrder) -> bool:
         """
-        Clamp completed order lifetime to the configured time-censor horizon.
+        Clamp a completed order to the configured time-censor horizon.
+
+        Args:
+            order: Completed order to clamp.
 
         Returns:
             True if the order was clipped to the horizon, otherwise False.
@@ -743,7 +800,7 @@ class OrderTracker:
         self, record: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Filter a record to exclude representation columns for unselected modes.
+        Filter representation columns for unselected modes.
 
         Args:
             record: Dictionary record from TrackedOrder.to_dict()
@@ -775,7 +832,7 @@ class OrderTracker:
         self, out_buffer, parquet_writer, output_parquet, parquet_batch_size
     ):
         """
-        Flush buffered records to Parquet when buffer reaches batch size.
+        Flush buffered records to Parquet when the buffer is full.
 
         Args:
             out_buffer: List of dict records waiting to be written.
@@ -800,10 +857,10 @@ class OrderTracker:
         return out_buffer, parquet_writer
 
     def _init_day_schedule(self, day, day_start_ns, on_close_start_ns, samples_per_day):
-        """Create deterministic per-day schedules if not already present.
+        """Create a deterministic per-day schedule if needed.
 
-        Samples are scheduled uniformly between day_start_ns and on_close_start_ns
-        (10:00 AM - 3:30 PM ET).
+        Samples are scheduled uniformly between ``day_start_ns`` and
+        ``on_close_start_ns`` (10:00 AM to 3:30 PM ET).
         """
         if day in self.virtual_sample_schedule:
             return
@@ -840,7 +897,12 @@ class OrderTracker:
         self.pending_virtual[day] = []
 
     def _move_scheduled_virtual_to_pending(self, day, mbo_ts):
-        """Move scheduled virtual timestamps that have passed into pending."""
+        """Move scheduled virtual timestamps that have passed into pending.
+
+        Args:
+            day: Trading day key.
+            mbo_ts: Current MBO timestamp.
+        """
         v_schedule = self.virtual_sample_schedule.get(day, [])
         v_idx = self.virtual_sample_index.get(day, 0)
         pending_v = self.pending_virtual.get(day, [])
@@ -853,9 +915,11 @@ class OrderTracker:
     def _update_active_virtual(
         self, mbo, book, out_buffer, parquet_writer, parquet_batch_size, output_parquet
     ):
-        """Update all active virtual orders with the incoming MBO message.
-        Orders that finish by fill are moved to post_trade_virtual for post-trade context.
-        Others are appened to `out_buffer` immediately for eventual write.
+        """Update active virtual orders for an incoming MBO message.
+
+        Orders that finish by fill are moved to ``post_trade_virtual`` for
+        post-trade context. Other completed orders are appended to the output
+        buffer immediately.
         """
         next_active_virtual = []
         for v in self.active_virtual:
@@ -902,7 +966,17 @@ class OrderTracker:
         parquet_batch_size,
         output_parquet,
     ):
-        """Finalize all open orders at regular-session end for the trading day."""
+        """Finalize open orders at regular-session end.
+
+        Args:
+            day_end_ts: Trading-day close timestamp.
+            day: Trading day key.
+            book: Current book state.
+            out_buffer: Pending output records.
+            parquet_writer: Active Parquet writer, if any.
+            parquet_batch_size: Buffer size threshold for flushing.
+            output_parquet: Output file path.
+        """
         if self.active_virtual:
             for v in self.active_virtual:
                 if v.is_active():
@@ -963,11 +1037,12 @@ class OrderTracker:
     def _update_post_trade_virtual(
         self, mbo, book, out_buffer, parquet_writer, parquet_batch_size, output_parquet
     ):
-        """Update post-trade virtuals and capture BBO at each configured time window.
+        """Update post-trade virtuals and capture BBO at configured windows.
 
-        For each post-trade virtual order, checks if any of the configured windows
-        have been reached (e.g., 1ms, 10ms, 50ms, etc.). Records the market BBO at
-        each reached window, and finalizes the order once all windows are captured.
+        For each post-trade virtual order, check whether any configured
+        windows have been reached and record the market BBO at each reached
+        window. Finalize the order once all windows are captured or the
+        deadline is exceeded.
         """
         next_post_trade_virtual = []
         for v in self.post_trade_virtual:
@@ -1026,11 +1101,12 @@ class OrderTracker:
         List[List[float]],
         List[List[float]],
     ]:
-        """Build variable-length historical sequences from the snapshot buffer for all modes.
+        """Build variable-length historical sequences from the snapshot buffer.
 
         Returns:
-            Tuple of (entry_market_depth, entry_moving_window, entry_raw_top5,
-                     entry_diff_top5, toxicity_representation, unused_legacy)
+            Tuple of ``(entry_market_depth, entry_moving_window,
+            entry_raw_top5, entry_diff_top5, toxicity_representation,
+            unused_legacy)``.
         """
         if not self.include_representation:
             return [], [], [], [], [], []
@@ -1127,7 +1203,7 @@ class OrderTracker:
     def _append_snapshot_to_active_virtuals(
         self, bids_snap: Dict[int, int], asks_snap: Dict[int, int], ts_event: int
     ) -> None:
-        """Append one feature step to active orders for all representation modes.
+        """Append one feature step to active orders for all modes.
 
         Args:
             bids_snap: Dict of bid prices to aggregate sizes.
@@ -1229,11 +1305,11 @@ class OrderTracker:
 
     def _spawn_virtuals_for_pending(self, day, book, best_bid, best_ask):
         """
-        Spawn virtual orders for any pending scheduled timestamps.
+        Spawn virtual orders for pending scheduled timestamps.
 
-        For each pending timestamp the function computes the queue ahead
-        (with a relaxed fallback to the nearest populated level) and
-        appends a new `VirtualOrder` to the active list.
+        For each pending timestamp, compute the queue ahead (with a relaxed
+        fallback to the nearest populated level) and append a new
+        ``VirtualOrder`` to the active list.
         """
         pending_v = self.pending_virtual.get(day, [])
         while pending_v:
@@ -1421,7 +1497,6 @@ class OrderTracker:
         self,
         file_path: str,
         output_parquet: str,
-        limit: int = 10_000_000,
         progress_interval: int = 100000,
         progress_callback: Optional[Callable[[int, int, int], None]] = None,
         samples_per_day: int = 100,
@@ -1432,34 +1507,28 @@ class OrderTracker:
         tqdm_desc: Optional[str] = None,
         tqdm_total: Optional[int] = None,
     ):
-        """
-        Stream MBO messages from `file_path` and write tracked orders.
+        """Stream MBO messages from ``file_path`` and write tracked orders.
 
         Args:
-            file_path: Path to DBN file to stream.
-            output_parquet: Path to output Parquet file to write records.
-            limit: Optional message limit to process.
-            progress_interval: Interval (messages) to update the progress bar.
+            file_path: Path to the DBN file to stream.
+            output_parquet: Path to the output Parquet file.
+            progress_interval: Message interval for progress updates.
             progress_callback: Optional callable invoked as
-                `(count, last_ts, active_virtual)`.
+                ``(count, last_ts, active_virtual)``.
             samples_per_day: Target number of samples per trading day.
-            target_day: Optional local date filter (`YYYY-MM-DD`, New York time).
-                When provided, only messages from this trading day are sampled.
+            target_day: Optional local date filter (``YYYY-MM-DD``, New York
+                time). When provided, only messages from that day are sampled.
             chunk_ts_start: Optional nanosecond timestamp; messages strictly
                 before this value are skipped without affecting book state.
-                Pass an empty-market boundary so book initialises cleanly.
-            chunk_ts_end: Optional nanosecond timestamp; iteration stops when
-                a message at or beyond this value is encountered.
-            tqdm_position: Row position of this bar in the terminal (for
-                simultaneous multi-chunk display).  Pass ``None`` for
-                single-stream use.
+            chunk_ts_end: Optional nanosecond timestamp; iteration stops when a
+                message at or beyond this value is encountered.
+            tqdm_position: Terminal row position for multi-chunk display.
             tqdm_desc: Label shown to the left of the progress bar.
         """
         output_parquet = _prepare_output_path(output_parquet)
         self._chunk_ts_start = chunk_ts_start
         self._chunk_ts_end = chunk_ts_end
         data = db.DBNStore.from_file(file_path)
-        count = 0
         last_ts = 0
         _desc = tqdm_desc or (
             f"Chunk {tqdm_position}" if tqdm_position is not None else "Processing"
@@ -1477,8 +1546,6 @@ class OrderTracker:
                 _total = (data.nbytes // _rec_size) if _rec_size > 0 else None
             except Exception:
                 _total = None
-        if _total and limit:
-            _total = min(_total, limit)
 
         pbar = tqdm(
             desc=_desc,
@@ -1507,15 +1574,12 @@ class OrderTracker:
         chunk_count = 0  # Counter for messages within this chunk
 
         for mbo in data:
-            count += 1
             last_ts = mbo.ts_event
 
             # Chunk boundary guards - check these first before updating progress
             if chunk_ts_start is not None and mbo.ts_event < chunk_ts_start:
                 continue
             if chunk_ts_end is not None and mbo.ts_event >= chunk_ts_end:
-                break
-            if limit and count > limit:
                 break
 
             # Message is within chunk boundaries, increment chunk counter
@@ -1675,7 +1739,6 @@ class OrderTracker:
                 }
                 # Include timestamp in snapshot tuple for time delta calculation
                 self._lob_snapshot_buffer.append((bids_snap, asks_snap, mbo.ts_event))
-                self._last_snapshot_ts = mbo.ts_event
                 self._message_count_since_snapshot = 0
                 self._append_snapshot_to_active_virtuals(
                     bids_snap, asks_snap, mbo.ts_event
@@ -1756,7 +1819,6 @@ class OrderTracker:
         output_parquet: str,
         n_workers: int = 4,
         empty_points: Optional[List[int]] = None,
-        limit: int = None,
         progress_interval: int = 100_000,
         samples_per_day: int = 100,
         target_day: Optional[str] = None,
@@ -1764,39 +1826,22 @@ class OrderTracker:
         messages_between_splits: Optional[List[int]] = None,
         total_messages: Optional[int] = None,
     ) -> None:
-        """
-        Parallel variant of :meth:`process_stream`.
+        """Parallel variant of :meth:`process_stream`.
 
-        Strategy
-        --------
-        1. **Scan pass** - stream the file once cheaply to find every
-           timestamp where the market book transitions from non-empty to
-           completely empty (:func:`find_empty_market_points`).  These are
-           valid split points because each chunk can begin with a clean
-           (empty) book state.
-        2. **Split** - pick ``n_workers - 1`` empty points that best
-           divide the timeline into *n_workers* equal-length intervals
-           (:func:`_select_split_points`).
-        3. **Parallel chunks** - each worker opens the file independently,
-           skips messages before its ``chunk_ts_start``, processes up to
-           its ``chunk_ts_end``, and writes to a private temp Parquet file.
-           Workers run in separate *processes* (``ProcessPoolExecutor``) to
-           bypass the GIL.
-        4. **Merge** - concatenate all temp Parquet files into
-           *output_parquet* in chunk order and remove the temp files.
+          Strategy:
+                1. Scan the file once to find empty-market transition points.
+                2. Select split timestamps that divide the file into roughly
+                    equal chunks.
+                3. Process each chunk in a separate worker process.
+                4. Merge the temporary Parquet outputs in chunk order.
 
         Args:
             file_path: Path to the DBN or DBN.ZST file.
             output_parquet: Path to the final merged Parquet output.
-            n_workers: Number of parallel worker processes.
-            empty_points: Pre-computed list of empty-market timestamps (ns).
-                If *None* the scan pass is run automatically.
-            limit: Per-chunk message limit forwarded to
-                :meth:`process_stream`.
-            progress_interval: Progress-print interval forwarded to each
-                worker.
-            samples_per_day: Samples per trading day forwarded to each
-                worker.
+            n_workers: Number of worker processes.
+            empty_points: Precomputed list of empty-market timestamps in ns.
+            progress_interval: Progress-print interval forwarded to each worker.
+            samples_per_day: Samples per trading day forwarded to each worker.
             target_day: Optional day filter forwarded to each worker.
             empty_scan_verbose: Print progress during the scan pass.
         """
@@ -1836,9 +1881,11 @@ class OrderTracker:
                 # total messages with ts_event < split_ts[i].
                 running = 0
                 total_before_point: Dict[int, int] = {}
-                for i, split_point in enumerate(empty_points):
+                for split_point, seg_count in zip(
+                    empty_points, messages_between_splits[:-1]
+                ):
                     total_before_point[int(split_point)] = running
-                    running += int(messages_between_splits[i])
+                    running += int(seg_count)
 
                 calculated_total = running + int(messages_between_splits[-1])
                 resolved_total = (
@@ -1875,7 +1922,14 @@ class OrderTracker:
                 _file_ts_end = None
 
             def _per_chunk_total(ts_end: Optional[int]) -> Optional[int]:
-                """Records from file start up to ts_end (None means full file)."""
+                """Estimate the number of records up to a chunk boundary.
+
+                Args:
+                    ts_end: Chunk end timestamp. ``None`` means the full file.
+
+                Returns:
+                    Estimated record count up to ``ts_end``.
+                """
                 if (
                     _full_records is None
                     or _file_ts_start is None
@@ -1944,7 +1998,6 @@ class OrderTracker:
                     chunk_ts_start=ts_start,
                     chunk_ts_end=ts_end,
                     chunk_idx=i,
-                    limit=limit,
                     progress_interval=progress_interval,
                     samples_per_day=samples_per_day,
                     target_day=target_day,
@@ -1955,7 +2008,6 @@ class OrderTracker:
             )
 
         # Process chunks in parallel
-        results: List[Optional[dict]] = [None] * actual_workers
         with ProcessPoolExecutor(max_workers=actual_workers) as executor:
             future_to_idx = {
                 executor.submit(_chunk_worker, args): args["chunk_idx"]
@@ -1965,7 +2017,6 @@ class OrderTracker:
                 idx = future_to_idx[future]
                 try:
                     res = future.result()
-                    results[idx] = res
                     self.inst.scheduled_virtual += res["scheduled_virtual"]
                     self.inst.spawned_virtual += res["spawned_virtual"]
                     print(
@@ -1979,7 +2030,7 @@ class OrderTracker:
 
         # Merge temp Parquet files in chunk order
         tables: List[pa.Table] = []
-        for i, tmp in enumerate(temp_files):
+        for tmp in temp_files:
             if os.path.exists(tmp):
                 tables.append(pq.read_table(tmp))
             else:

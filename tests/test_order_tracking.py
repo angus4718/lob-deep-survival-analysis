@@ -239,6 +239,30 @@ def test_virtual_multiple_events_same_ts_cumulative():
     assert v.current_vahead == 6
 
 
+def test_virtual_depletion_fills_on_same_message():
+    v = VirtualOrder(
+        internal_id=31,
+        entry_time=0,
+        price=100,
+        side="B",
+        current_vahead=2,
+        ids_ahead={1: 2},
+    )
+    bid_level = DummyLevel(orders=[(11, 5)])
+    ask_level = DummyLevel(orders=[(21, 6)])
+    book = DummyBook(bids={100: bid_level}, offers={101: ask_level})
+    mbo = DummyMBO(ts_event=123, order_id=1, action="F", size=2)
+
+    v.update(mbo, book, None)
+
+    assert v.status == "FILLED"
+    assert v.end_time == 123
+    assert v.best_bid_at_execution == 100
+    assert v.best_ask_at_execution == 101
+    assert isinstance(v.post_trade_windows_ms, list)
+    assert v.post_trade_deadline_ts is not None
+
+
 def test_time_censor_boundary_not_censored_at_equal():
     tr = OrderTracker(samples_per_day=1, time_censor_s=1.0)
     v = VirtualOrder(
