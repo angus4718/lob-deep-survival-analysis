@@ -139,13 +139,15 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
             execution_half_spread = (
                 best_ask_at_execution - best_bid_at_execution
             ) / 2.0
-            threshold_bps = (execution_half_spread / execution_price) * 10000
+            mid_price_at_fill = (best_bid_at_execution + best_ask_at_execution) / 2.0
+            threshold_bps = (execution_half_spread / mid_price_at_fill) * 10000
             extra["spread_source"] = "execution"
             extra["spread_threshold_bps"] = threshold_bps
         # Threshold 2 (Fallback): entry spread only for ultra-fast fills (< 100ms)
         elif duration_s < 0.1:
             entry_half_spread = (best_ask_at_entry - best_bid_at_entry) / 2.0
-            threshold_bps = (entry_half_spread / execution_price) * 10000
+            entry_mid_price = (best_bid_at_entry + best_ask_at_entry) / 2.0
+            threshold_bps = (entry_half_spread / entry_mid_price) * 10000
             extra["spread_source"] = "entry (ultra-fast, duration < 100ms)"
             extra["spread_threshold_bps"] = threshold_bps
         # Threshold 3 (Invalid): long resting orders without a valid spread source
@@ -163,16 +165,17 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
             extra["post_trade_recorded"] = False
             return EventType.CENSORED, extra
 
-        # === CALCULATE ADVERSE MOVE (normalized by execution_price) ===
+        # === CALCULATE ADVERSE MOVE (normalized by mid_price_at_fill) ===
+        mid_price_at_fill = (best_bid_at_execution + best_ask_at_execution) / 2.0
         if side == "B":
             # BUY: adverse when mid price fell after fill
             adverse_move_bps = (
-                (execution_price - post_trade_mid) / execution_price
+                (execution_price - post_trade_mid) / mid_price_at_fill
             ) * 10000
         elif side == "A":
             # SELL: adverse when mid price rose after fill
             adverse_move_bps = (
-                (post_trade_mid - execution_price) / execution_price
+                (post_trade_mid - execution_price) / mid_price_at_fill
             ) * 10000
         else:
             # Unknown side, cannot classify reliably
@@ -182,7 +185,7 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
         extra["post_trade_adverse_move_bps"] = adverse_move_bps
 
         # === CLASSIFY ===
-        if adverse_move_bps <= threshold_bps:
+        if adverse_move_bps < threshold_bps:
             return EventType.FAVORABLE_FILL, extra
         else:
             return EventType.TOXIC_FILL, extra
