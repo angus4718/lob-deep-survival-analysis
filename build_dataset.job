@@ -1,0 +1,88 @@
+#!/bin/bash
+#SBATCH -J lob_build
+#SBATCH -p RM-512
+#SBATCH -N 1
+#SBATCH -n 32
+#SBATCH --ntasks-per-node=32
+#SBATCH -t 12:00:00
+
+# Remember to add a logs/ folder in your repository.
+# Update this array range to match the number of tickers in TICKERS.
+# Run sbatch -A cis260122p build_dataset.job to submit the job.
+# Run sacct -j <job_id> --format=JobID,State,ExitCode,Reason to check the status of the job.
+#SBATCH --array=0-5
+
+#SBATCH -o logs/build_dataset_%A_%a.out
+
+set -euo pipefail
+set -x
+
+# ---- User config ----
+PROJECT_DIR="/ocean/projects/cis260122p/ccheung1/lob-deep-survival-analysis"
+CONDA_SH="/opt/packages/anaconda3-2024.10-1/etc/profile.d/conda.sh"
+CONDA_ENV="lob"
+
+# Edit this list to your ticker universe.
+TICKERS=(
+	"AMZN"
+	"CRM"
+    "CSCO"
+    "GILD"
+    "INTC"
+    "ISRG"
+)
+
+# Fixed windows requested:
+START_DATES=("2025-10-01" "2025-11-01" "2025-12-01")
+END_DATES=("2025-11-01" "2025-12-01" "2026-01-01")
+
+# ---- Derived mapping from array index -> ticker ----
+N_TICKERS=${#TICKERS[@]}
+N_WINDOWS=${#START_DATES[@]}
+
+if [[ "${SLURM_ARRAY_TASK_ID}" -ge "${N_TICKERS}" ]]; then
+	echo "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID} is out of range (N_TICKERS=${N_TICKERS})."
+	exit 1
+fi
+
+TICKER_IDX=${SLURM_ARRAY_TASK_ID}
+SYMBOL="${TICKERS[$TICKER_IDX]}"
+
+mkdir -p "${PROJECT_DIR}/logs"
+cd "${PROJECT_DIR}"
+
+source "${CONDA_SH}"
+conda activate "${CONDA_ENV}"
+
+echo "Running build_dataset.py for ${SYMBOL} across ${N_WINDOWS} date ranges in parallel"
+
+TOTAL_CPUS=${SLURM_NTASKS:-32}
+WORKERS_PER_WINDOW=30
+
+echo "Allocated CPUs per ticker task: ${TOTAL_CPUS}"
+echo "N_WORKERS per date-window run: ${WORKERS_PER_WINDOW}"
+
+pids=()
+for ((i = 0; i < N_WINDOWS; i++)); do
+	start_date="${START_DATES[$i]}"
+	end_date="${END_DATES[$i]}"
+	log_prefix="logs/build_dataset_${SYMBOL}_${start_date}_to_${end_date}"
+
+	SYMBOL="${SYMBOL}" \
+	START_DATE="${start_date}" \
+	END_DATE="${end_date}" \
+	N_WORKERS="${WORKERS_PER_WINDOW}" \
+	OMP_NUM_THREADS=1 \
+	python scripts/build_dataset.py > "${log_prefix}.out" 2> "${log_prefix}.err" &
+
+	pids+=("$!")
+done
+
+status=0
+for pid in "${pids[@]}"; do
+	if ! wait "${pid}"; then
+		status=1
+	fi
+done
+
+exit "${status}"

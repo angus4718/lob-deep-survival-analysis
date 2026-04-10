@@ -39,9 +39,6 @@ from src.order_tracking import (
 )
 from src.config import CONFIG
 
-# Skip the first segment if raw data already exists (saves time when iterating on labeling)
-SKIP_FIRST_SEGMENT_IF_RAW_DATA_EXISTS = True
-
 SYMBOL = "AAPL"
 START_DATE = "2026-01-05"
 END_DATE = "2026-01-10"
@@ -58,7 +55,7 @@ PROGRESS_INTERVAL = 100_000
 # LOB representation modes to include in dataset.
 # Valid options: "market_depth", "moving_window", "raw_top5", "diff_top5"
 # Default: all four modes.
-REPRESENTATION_MODES = ["raw_top5"]
+REPRESENTATION_MODES = ["market_depth", "raw_top5", "diff_top5"]
 
 # Set to a "YYYY-MM-DD" string to restrict processing to a single trading day,
 # or None to process the entire file.
@@ -66,14 +63,33 @@ TARGET_DAY = None  # e.g. "2025-12-01"
 
 # Set the number of parallel worker processes,
 # or None to auto-select based on available CPU cores (leaving 2 cores free).
-N_WORKERS = 10
+N_WORKERS = 30
+
+
+def _get_env_int(name: str, default: int | None) -> int | None:
+    """Parse optional integer env var with a clear fallback."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"Invalid integer for {name}={raw!r}. Using default: {default}")
+        return default
+
+
+# Allow runtime overrides so this script can be used by SLURM job arrays.
+SYMBOL = os.getenv("SYMBOL", SYMBOL)
+START_DATE = os.getenv("START_DATE", START_DATE)
+END_DATE = os.getenv("END_DATE", END_DATE)
+N_WORKERS = _get_env_int("N_WORKERS", N_WORKERS)
 
 FILE_NAME = (
     f"XNAS_ITCH_{SYMBOL}_mbo_{START_DATE.replace('-', '')}_{END_DATE.replace('-', '')}"
 )
-dbn_path = Path("data") / "raw" / f"{FILE_NAME}.dbn.zst"
-output_path = Path("data") / "datasets" / f"dataset_{FILE_NAME}.parquet"
-split_cache_path = Path("data") / "datasets" / f"{FILE_NAME}_split_points.json"
+dbn_path = Path("/ocean/projects/cis260122p/shared/data/raw") / SYMBOL / f"{FILE_NAME}.dbn.zst"
+output_path = Path("/ocean/projects/cis260122p/shared/data/datasets") / f"dataset_{FILE_NAME}.parquet"
+split_cache_path = Path("/ocean/projects/cis260122p/shared/data/datasets") / f"{FILE_NAME}_split_points.json"
 
 
 def _load_or_build_split_cache(cache_path: Path, dbn_file: Path) -> dict:
@@ -124,61 +140,54 @@ def main() -> None:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Check if raw data already exists and we should skip the first segment
-    if SKIP_FIRST_SEGMENT_IF_RAW_DATA_EXISTS and output_path.exists():
-        print(f"[main] Raw data already exists at {output_path}")
-        print(
-            f"[main] Skipping first segment (SKIP_FIRST_SEGMENT_IF_RAW_DATA_EXISTS=True)"
+    # Process raw data from DBN file.
+    print("[main] Starting processing of raw data from DBN file...")
+
+    tracker = OrderTracker(
+        samples_per_day=SAMPLES_PER_DAY,
+        time_censor_s=TIME_CENSOR_S,
+        lookback_period=LOOKBACK_PERIOD,
+        random_seed=RANDOM_SEED,
+        snapshot_bin_messages=SNAPSHOT_BIN_MESSAGES,
+        representation_modes=REPRESENTATION_MODES,
+    )
+
+    if N_WORKERS > 1:
+        print(f"Running in parallel mode with {N_WORKERS} workers.")
+
+        split_cache = _load_or_build_split_cache(split_cache_path, dbn_path)
+        empty_points = split_cache.get("split_points", [])
+        messages_between_splits = split_cache.get("messages_between_splits")
+        total_messages = split_cache.get("total_messages")
+
+        tracker.process_stream_parallel(
+            file_path=str(dbn_path),
+            output_parquet=str(output_path),
+            n_workers=N_WORKERS,
+            empty_points=empty_points,
+            messages_between_splits=messages_between_splits,
+            total_messages=total_messages,
+            progress_interval=PROGRESS_INTERVAL,
+            samples_per_day=SAMPLES_PER_DAY,
+            target_day=TARGET_DAY,
         )
     else:
-        # First segment: process raw data from DBN file
-        print("[main] Starting first segment: processing raw data from DBN file...")
-
-        tracker = OrderTracker(
+        print("Running in single-process mode.")
+        tracker.process_stream(
+            file_path=str(dbn_path),
+            output_parquet=str(output_path),
+            progress_interval=PROGRESS_INTERVAL,
             samples_per_day=SAMPLES_PER_DAY,
-            time_censor_s=TIME_CENSOR_S,
-            lookback_period=LOOKBACK_PERIOD,
-            random_seed=RANDOM_SEED,
-            snapshot_bin_messages=SNAPSHOT_BIN_MESSAGES,
-            representation_modes=REPRESENTATION_MODES,
+            target_day=TARGET_DAY,
         )
 
-        if N_WORKERS > 1:
-            print(f"Running in parallel mode with {N_WORKERS} workers.")
+    parquet_file = pq.ParquetFile(output_path)
+    columns = parquet_file.schema.names
+    shape = (parquet_file.metadata.num_rows, len(columns))
 
-            split_cache = _load_or_build_split_cache(split_cache_path, dbn_path)
-            empty_points = split_cache.get("split_points", [])
-            messages_between_splits = split_cache.get("messages_between_splits")
-            total_messages = split_cache.get("total_messages")
-
-            tracker.process_stream_parallel(
-                file_path=str(dbn_path),
-                output_parquet=str(output_path),
-                n_workers=N_WORKERS,
-                empty_points=empty_points,
-                messages_between_splits=messages_between_splits,
-                total_messages=total_messages,
-                progress_interval=PROGRESS_INTERVAL,
-                samples_per_day=SAMPLES_PER_DAY,
-                target_day=TARGET_DAY,
-            )
-        else:
-            print("Running in single-process mode.")
-            tracker.process_stream(
-                file_path=str(dbn_path),
-                output_parquet=str(output_path),
-                progress_interval=PROGRESS_INTERVAL,
-                samples_per_day=SAMPLES_PER_DAY,
-                target_day=TARGET_DAY,
-            )
-
-        parquet_file = pq.ParquetFile(output_path)
-        columns = parquet_file.schema.names
-        shape = (parquet_file.metadata.num_rows, len(columns))
-
-        print("Dataset shape:", shape)
-        print("Columns:", columns)
-        print(f"\nDataset written to {output_path}")
+    print("Dataset shape:", shape)
+    print("Columns:", columns)
+    print(f"\nDataset written to {output_path}")
 
 
 if __name__ == "__main__":
