@@ -1,0 +1,63 @@
+#!/bin/bash
+#SBATCH -J lob_label
+#SBATCH -p RM-512
+#SBATCH -N 1
+#SBATCH -n 128
+#SBATCH --ntasks-per-node=128
+#SBATCH -t 12:00:00
+
+# Remember to add a logs/ folder in your repository.
+# Run sbatch -A cis260122p label_dataset.job to submit the job.
+# Run sacct -j <job_id> --format=JobID,State,ExitCode,Reason to check the status of the job.
+
+#SBATCH -o logs/label_dataset_%A.out
+
+set -euo pipefail
+set -x
+
+# ---- User config ----
+PROJECT_DIR="/ocean/projects/cis260122p/ccheung1/lob-deep-survival-analysis"
+CONDA_SH="/opt/packages/anaconda3-2024.10-1/etc/profile.d/conda.sh"
+CONDA_ENV="lob"
+DATASETS_DIR="/ocean/projects/cis260122p/shared/data/datasets"
+
+# Edit this list to your ticker universe.
+TICKERS=(
+	"AMZN"
+	"CRM"
+    "CSCO"
+    "GILD"
+    "INTC"
+    "ISRG"
+    "MSFT"
+)
+
+# Single date range for labeling:
+START_DATE="2025-10-01"
+END_DATE="2026-01-01"
+
+mkdir -p "${PROJECT_DIR}/logs"
+cd "${PROJECT_DIR}"
+
+source "${CONDA_SH}"
+conda activate "${CONDA_ENV}"
+
+TOTAL_CPUS=${SLURM_NTASKS:-32}
+
+echo "Allocated CPUs for sequential labeling job: ${TOTAL_CPUS}"
+
+for SYMBOL in "${TICKERS[@]}"; do
+    echo "Running label_dataset.py for ${SYMBOL} from ${START_DATE} to ${END_DATE}"
+    log_prefix="logs/label_dataset_${SYMBOL}_${START_DATE}_to_${END_DATE}"
+    SYMBOL="${SYMBOL}" \
+    START_DATE="${START_DATE}" \
+    END_DATE="${END_DATE}" \
+    OMP_NUM_THREADS=1 \
+    python scripts/label_dataset.py \
+        --ticker "${SYMBOL}" \
+        --start-date "${START_DATE}" \
+        --end-date "${END_DATE}" \
+        --datasets-dir "${DATASETS_DIR}" > "${log_prefix}.out" 2> "${log_prefix}.err"
+done
+
+exit $?

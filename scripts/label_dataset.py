@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -18,15 +20,58 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.labeling.window_selecting import MarkoutAnalyzer, StabilizationWindowSelector
 from src.labeling.competing_risks import ExecutionCompetingRisksLabeler
 
-# User configuration
-RAW_DATASET_PATH = (
-    Path("data") / "datasets" / "dataset_XNAS_ITCH_AAPL_mbo_20260105_20260110.parquet"
-)
-OUTPUT_DATASET_PATH = (
-    Path("data")
-    / "datasets"
-    / "labeled_dataset_XNAS_ITCH_AAPL_mbo_20260105_20260110.parquet"
-)
+
+DEFAULT_TICKER = "AAPL"
+DEFAULT_START_DATE = "2025-10-01"
+DEFAULT_END_DATE = "2026-01-01"
+DEFAULT_DATASETS_DIR = Path("/ocean/projects/cis260122p/shared/data/datasets")
+
+
+def _dataset_paths(
+    ticker: str, start_date: str, end_date: str, datasets_dir: Path
+) -> tuple[Path, Path]:
+    """Build input/output dataset paths from ticker and date bounds."""
+    start_ymd = start_date.replace("-", "")
+    end_ymd = end_date.replace("-", "")
+    raw_path = (
+        datasets_dir
+        / f"raw_dataset_XNAS_ITCH_{ticker}_mbo_{start_ymd}_{end_ymd}.parquet"
+    )
+    labeled_path = (
+        datasets_dir
+        / f"labeled_dataset_XNAS_ITCH_{ticker}_mbo_{start_ymd}_{end_ymd}.parquet"
+    )
+    return raw_path, labeled_path
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Apply adaptive toxic window labeling to a raw dataset."
+    )
+    parser.add_argument(
+        "--ticker",
+        default=os.getenv("SYMBOL", DEFAULT_TICKER),
+        help="Ticker symbol used in dataset filename (default: env SYMBOL or AAPL).",
+    )
+    parser.add_argument(
+        "--start-date",
+        default=os.getenv("START_DATE", DEFAULT_START_DATE),
+        help="Start date in YYYY-MM-DD format (default: env START_DATE or 2025-10-01).",
+    )
+    parser.add_argument(
+        "--end-date",
+        default=os.getenv("END_DATE", DEFAULT_END_DATE),
+        help="End date in YYYY-MM-DD format (default: env END_DATE or 2026-01-01).",
+    )
+    parser.add_argument(
+        "--datasets-dir",
+        default=os.getenv("DATASETS_DIR", str(DEFAULT_DATASETS_DIR)),
+        help=(
+            "Directory containing raw/labeled dataset parquet files "
+            "(default: env DATASETS_DIR or shared datasets path)."
+        ),
+    )
+    return parser.parse_args()
 
 
 def _compute_day_boundary_splits(df_raw: pd.DataFrame):
@@ -213,8 +258,16 @@ def label_dataset_adaptive_toxic_window(
 
 
 def main() -> None:
-    """Apply adaptive toxic window labeling to the configured dataset."""
-    label_dataset_adaptive_toxic_window(RAW_DATASET_PATH, OUTPUT_DATASET_PATH)
+    """Apply adaptive toxic window labeling with optional CLI overrides."""
+    args = _parse_args()
+    datasets_dir = Path(args.datasets_dir)
+    raw_path, output_path = _dataset_paths(
+        ticker=args.ticker,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        datasets_dir=datasets_dir,
+    )
+    label_dataset_adaptive_toxic_window(raw_path, output_path)
 
 
 if __name__ == "__main__":

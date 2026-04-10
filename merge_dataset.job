@@ -1,0 +1,58 @@
+#!/bin/bash
+#SBATCH -J lob_merge
+#SBATCH -p RM-512
+#SBATCH -N 1
+#SBATCH -n 128
+#SBATCH --ntasks-per-node=128
+#SBATCH -t 12:00:00
+
+# Remember to add a logs/ folder in your repository.
+# Update this array range to match the number of tickers in TICKERS.
+# Run sbatch -A cis260122p merge_dataset.job to submit the job.
+# Run sacct -j <job_id> --format=JobID,State,ExitCode,Reason to check the status of the job.
+#SBATCH --array=0-6
+
+#SBATCH -o logs/merge_dataset_%A_%a.out
+
+set -euo pipefail
+set -x
+
+# ---- User config ----
+PROJECT_DIR="/ocean/projects/cis260122p/ccheung1/lob-deep-survival-analysis"
+CONDA_SH="/opt/packages/anaconda3-2024.10-1/etc/profile.d/conda.sh"
+CONDA_ENV="lob"
+
+# Edit this list to your ticker universe.
+TICKERS=(
+	"AMZN"
+	"CRM"
+    "CSCO"
+    "GILD"
+    "INTC"
+    "ISRG"
+)
+
+# ---- Derived mapping from array index -> ticker ----
+N_TICKERS=${#TICKERS[@]}
+
+if [[ "${SLURM_ARRAY_TASK_ID}" -ge "${N_TICKERS}" ]]; then
+	echo "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID} is out of range (N_TICKERS=${N_TICKERS})."
+	exit 1
+fi
+
+TICKER_IDX=${SLURM_ARRAY_TASK_ID}
+SYMBOL="${TICKERS[$TICKER_IDX]}"
+
+mkdir -p "${PROJECT_DIR}/logs"
+cd "${PROJECT_DIR}"
+
+source "${CONDA_SH}"
+conda activate "${CONDA_ENV}"
+
+echo "Running merge_datasets.py for ${SYMBOL}"
+
+log_prefix="logs/merge_dataset_${SYMBOL}"
+
+python scripts/merge_datasets.py --ticker "${SYMBOL}" --verbose > "${log_prefix}.out" 2> "${log_prefix}.err"
+
+exit $?
