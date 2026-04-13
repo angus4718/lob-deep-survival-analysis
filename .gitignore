@@ -6,3 +6,5 @@ data/
 artifacts/
 .vscode/
 logs/
+wandb/
+results/

@@ -1,0 +1,24 @@
+name: lob
+channels:
+  - conda-forge
+  - pytorch
+  - nvidia
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pandas
+  - pyarrow
+  - matplotlib
+  - pytorch
+  - pytorch-cuda=12.4
+  - scikit-learn
+  - tqdm
+  - pip:
+      - databento==0.75.0
+      - pycox==0.3.0
+      - python-dotenv==1.2.2
+      - sortedcontainers==2.4.0
+      - wandb
+      - ipywidgets
+  - pytest==9.0.2
