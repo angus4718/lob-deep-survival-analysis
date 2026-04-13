@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from .base import BaseDeepHitCompetingModel, masked_attention_pooling
 
@@ -109,7 +110,10 @@ class DeepHitMambaCompeting(BaseDeepHitCompetingModel):
         last_input_proj = self.input_proj_residual(x[:, -1, :])
 
         for layer in self.ssm_layers:
-            h = layer(h)
+            if self.training and h.requires_grad:
+                h = checkpoint(layer, h, use_reentrant=False)
+            else:
+                h = layer(h)
         h = self.output_norm(h)
 
         query = self.attn_query_proj(last_input_proj)

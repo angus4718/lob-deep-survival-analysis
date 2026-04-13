@@ -61,10 +61,18 @@ class DeepHitTransformerCompeting(BaseDeepHitCompetingModel):
             use_batch_norm=True,
         )
 
+        self.pred_dim = num_features - 1
+        self.aux_head = nn.Linear(hidden_size, self.pred_dim)
+        self._cache: dict[str, torch.Tensor] = {}
         self.latest_transformer_output: torch.Tensor | None = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _lengths_from_mask(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         mask = x[:, :, -1]
+        lengths = mask.sum(dim=1).long().clamp(min=1, max=x.size(1))
+        return mask, lengths
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mask, lengths = self._lengths_from_mask(x)
         seq_len = x.size(1)
         if seq_len > self.max_seq_len:
             raise ValueError(f"Sequence length {seq_len} exceeds max_seq_len={self.max_seq_len}.")
@@ -84,6 +92,12 @@ class DeepHitTransformerCompeting(BaseDeepHitCompetingModel):
         tr_out = self.transformer(tr_in, src_key_padding_mask=padding_mask)
         self.latest_transformer_output = tr_out
 
+        self._cache = {
+            "state_out": tr_out,
+            "mask": mask,
+            "lengths": lengths,
+        }
+
         query = self.attn_query_proj(input_proj_residual)
         seq_repr = masked_attention_pooling(
             sequence=tr_out,
@@ -96,3 +110,24 @@ class DeepHitTransformerCompeting(BaseDeepHitCompetingModel):
         combined_repr = seq_repr + input_proj_residual
         logits = torch.stack([head(combined_repr) for head in self.cause_specific_heads], dim=1)
         return logits
+
+    def aux_next_step_loss(self, x: torch.Tensor) -> torch.Tensor:
+        """Auxiliary MSE loss to predict next-step features."""
+        if not self._cache:
+            _ = self.forward(x)
+
+        state_out = self._cache["state_out"]
+        mask = self._cache["mask"]
+
+        if x.size(1) <= 1:
+            return torch.tensor(0.0, dtype=torch.float32, device=x.device)
+
+        pred_next = self.aux_head(state_out[:, :-1, :])
+        target_next = x[:, 1:, : self.pred_dim]
+
+        pair_valid = (mask[:, 1:] > 0.5) & (mask[:, :-1] > 0.5)
+        pair_valid_f = pair_valid.float().unsqueeze(-1)
+
+        denom = pair_valid_f.sum() * self.pred_dim + 1e-8
+        mse = ((pred_next - target_next) ** 2 * pair_valid_f).sum() / denom
+        return mse

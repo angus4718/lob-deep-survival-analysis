@@ -71,6 +71,7 @@ def masked_attention_pooling(
     keys = key_projection(sequence)  # (batch, seq_len, hidden)
     scores = torch.bmm(query.unsqueeze(1), keys.transpose(1, 2)) * scale
     scores = scores.squeeze(1)  # (batch, seq_len)
-    scores = scores.masked_fill(~(mask > 0.5), -1e9)
+    fill_value = torch.finfo(scores.dtype).min
+    scores = scores.masked_fill(~(mask > 0.5), fill_value)
     weights = torch.softmax(scores, dim=1)  # (batch, seq_len)
     return torch.sum(sequence * weights.unsqueeze(-1), dim=1)
