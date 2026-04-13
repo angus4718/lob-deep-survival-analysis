@@ -21,4 +21,7 @@ dependencies:
       - sortedcontainers==2.4.0
       - wandb
       - ipywidgets
+      - papermill
+      - notebook
+      - jupyterlab
   - pytest==9.0.2
