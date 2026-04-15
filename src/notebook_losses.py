@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -109,12 +111,19 @@ def l2_rank_order_avg_from_cif(
     if batch_size == 0:
         return torch.zeros((), device=cif.device, dtype=cif.dtype)
 
+    eps_val = float(eps)
+    if (not math.isfinite(eps_val)) or eps_val <= 0.0:
+        raise ValueError(f"eps must be finite and > 0. Got {eps!r}")
+    sigma_raw = float(sigma)
+    if (not math.isfinite(sigma_raw)) or sigma_raw <= 0.0:
+        raise ValueError(f"sigma must be finite and > 0. Got {sigma!r}")
+
     tau = y.long().to(cif.device).clamp(0, num_bins - 1)
     event_code = d.long().to(cif.device)
     order_ids = order_ids.long().to(cif.device)
     update_idx = update_idx.long().to(cif.device)
 
-    sigma_val = max(float(sigma), eps)
+    sigma_val = max(sigma_raw, eps_val)
     sample_terms = torch.zeros(batch_size, device=cif.device, dtype=cif.dtype)
 
     unique_steps = torch.unique(update_idx, sorted=True)
@@ -183,7 +192,12 @@ def l3_aux_order_avg(
 ) -> torch.Tensor:
     """L3 auxiliary next-step prediction loss with exact order averaging."""
     zero = torch.zeros((), device=x.device, dtype=x.dtype)
-    if beta_l3 <= 0:
+    beta_val = float(beta_l3)
+    if not math.isfinite(beta_val):
+        raise ValueError(f"beta_l3 must be finite. Got {beta_l3!r}")
+    if beta_val < 0.0:
+        raise ValueError(f"beta_l3 must be >= 0. Got {beta_l3!r}")
+    if beta_val == 0.0:
         return zero
 
     cache = getattr(base_net, "_cache", None)
@@ -230,7 +244,7 @@ def l3_aux_order_avg(
         order_sum / order_count.clamp_min(1.0),
         torch.zeros_like(order_sum),
     )
-    return float(beta_l3) * order_avg.mean()
+    return beta_val * order_avg.mean()
 
 
 def dynamic_deephit_total_loss(
@@ -242,16 +256,25 @@ def dynamic_deephit_total_loss(
     x_batch: torch.Tensor,
     base_net,
     *,
+    alpha: float = 1.0,
     sigma: float = 0.1,
     beta_l3: float = 0.1,
     aux_target_dim: int | None = None,
     eps: float = 1e-8,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Compute L_total = L1 + L2 + L3 with exact order-level averaging."""
+    """Compute L_total = L1 + alpha * L2 + L3 with exact order-level averaging."""
+    alpha_val = float(alpha)
+    if (not math.isfinite(alpha_val)) or alpha_val < 0.0:
+        raise ValueError(f"alpha must be finite and >= 0. Got {alpha!r}")
+
+    eps_val = float(eps)
+    if (not math.isfinite(eps_val)) or eps_val <= 0.0:
+        raise ValueError(f"eps must be finite and > 0. Got {eps!r}")
+
     pmf = logits_to_pmf(logits)
     cif = pmf_to_cif(pmf)
 
-    l1 = l1_nll_order_avg_from_pmf(pmf, y, d, order_ids, eps=eps)
+    l1 = l1_nll_order_avg_from_pmf(pmf, y, d, order_ids, eps=eps_val)
     l2 = l2_rank_order_avg_from_cif(
         cif,
         y,
@@ -259,7 +282,7 @@ def dynamic_deephit_total_loss(
         order_ids,
         update_idx,
         sigma=sigma,
-        eps=eps,
+        eps=eps_val,
     )
     l3 = l3_aux_order_avg(
         base_net,
@@ -269,7 +292,7 @@ def dynamic_deephit_total_loss(
         aux_target_dim=aux_target_dim,
     )
 
-    total = l1 + l2 + l3
+    total = l1 + (alpha_val * l2) + l3
     return total, {"l1": l1, "l2": l2, "l3": l3}
 
 

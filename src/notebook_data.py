@@ -195,7 +195,6 @@ def build_dynamic_samples_manifest(
     lookback_steps: int,
     lob_dim: int,
     tox_dim: int,
-    min_remaining_s: float = 1e-6,
     admin_censor_time: float | None = None,
     duration_col: str = "duration_s",
     event_col: str = "event_type_competing",
@@ -208,7 +207,6 @@ def build_dynamic_samples_manifest(
     seq_len_col: str = "sequence_length",
     max_samples_per_order: int | None = None,
     validate_remaining_time: bool = True,
-    monotonic_tol_s: float = 1e-6,
 ) -> tuple[DynamicOrderStore, DynamicSampleManifest]:
     """Build compact order storage and sample manifest for dynamic samples.
 
@@ -221,9 +219,6 @@ def build_dynamic_samples_manifest(
 
     if max_samples_per_order is not None and max_samples_per_order < 1:
         raise ValueError("max_samples_per_order must be >= 1 or None")
-
-    if monotonic_tol_s < 0:
-        raise ValueError("monotonic_tol_s must be non-negative")
 
     order_lob_sequences: list[np.ndarray] = []
     order_tox_sequences: list[np.ndarray] = []
@@ -310,12 +305,12 @@ def build_dynamic_samples_manifest(
         prev_remaining_s: float | None = None
         for end_idx in sample_indices:
             elapsed_s = max(float(cum_elapsed_s[end_idx]), 0.0)
-            remaining_s_true = max(total_duration_s - elapsed_s, min_remaining_s)
+            remaining_s_true = max(total_duration_s - elapsed_s, 0.0)
 
             if (
                 validate_remaining_time
                 and prev_remaining_s is not None
-                and remaining_s_true > (prev_remaining_s + monotonic_tol_s)
+                and remaining_s_true > prev_remaining_s
             ):
                 raise ValueError(
                     "remaining time increased within one order; "
@@ -334,7 +329,7 @@ def build_dynamic_samples_manifest(
                 else:
                     sample_event_code = 0
                     remaining_s = min(remaining_s_true, admin_censor_time)
-                remaining_s = max(remaining_s, min_remaining_s)
+                remaining_s = max(remaining_s, 0.0)
 
             sample_order_ptr.append(order_ptr)
             sample_end_idx.append(end_idx)
@@ -456,17 +451,68 @@ def select_manifest_indices_by_order_ids(
     return np.flatnonzero(mask).astype(np.int64)
 
 
+def _cap_manifest_indices_random_by_source_row(
+    manifest: DynamicSampleManifest,
+    sample_indices: np.ndarray,
+    max_samples_per_source_row: int,
+    *,
+    seed: int | None,
+) -> np.ndarray:
+    """Randomly cap selected sample indices per source-row group."""
+    idx = np.asarray(sample_indices, dtype=np.int64).reshape(-1)
+    if idx.size == 0:
+        return np.empty((0,), dtype=np.int64)
+
+    cap = int(max_samples_per_source_row)
+    if cap < 1:
+        raise ValueError("max_samples_per_source_row must be >= 1 or None")
+
+    source_rows = manifest.source_row_idx[idx].astype(np.int64, copy=False)
+    rng = np.random.default_rng(seed)
+
+    selected_chunks: list[np.ndarray] = []
+    for source_row in np.unique(source_rows):
+        group_idx = idx[source_rows == source_row]
+        if group_idx.size > cap:
+            group_idx = np.sort(
+                rng.choice(group_idx, size=cap, replace=False).astype(np.int64)
+            )
+        else:
+            group_idx = np.sort(group_idx.astype(np.int64, copy=False))
+        selected_chunks.append(group_idx)
+
+    return np.sort(np.concatenate(selected_chunks).astype(np.int64, copy=False))
+
+
 def select_manifest_indices_by_source_rows(
     manifest: DynamicSampleManifest,
     target_source_rows: np.ndarray,
+    *,
+    max_samples_per_source_row: int | None = None,
+    seed: int | None = None,
 ) -> np.ndarray:
-    """Return sample indices whose source dataframe row index is in the target set."""
+    """Return manifest indices for source rows, with optional random per-row cap.
+
+    Args:
+        manifest: Dynamic sample manifest.
+        target_source_rows: Source dataframe row indices to select.
+        max_samples_per_source_row: Optional random cap per source row.
+        seed: Random seed used when cap is applied.
+    """
     target_source_rows_arr = np.asarray(target_source_rows, dtype=np.int64).reshape(-1)
     if target_source_rows_arr.size == 0 or len(manifest) == 0:
         return np.empty((0,), dtype=np.int64)
 
     mask = np.isin(manifest.source_row_idx, target_source_rows_arr)
-    return np.flatnonzero(mask).astype(np.int64)
+    selected = np.flatnonzero(mask).astype(np.int64)
+    if max_samples_per_source_row is None:
+        return selected
+    return _cap_manifest_indices_random_by_source_row(
+        manifest,
+        selected,
+        max_samples_per_source_row,
+        seed=seed,
+    )
 
 
 class DynamicSampleDataset(torch.utils.data.Dataset):
@@ -509,7 +555,6 @@ def build_dynamic_samples(
     lookback_steps: int,
     lob_dim: int,
     tox_dim: int,
-    min_remaining_s: float = 1e-6,
     admin_censor_time: float | None = None,
     duration_col: str = "duration_s",
     event_col: str = "event_type_competing",
@@ -522,7 +567,6 @@ def build_dynamic_samples(
     seq_len_col: str = "sequence_length",
     max_samples_per_order: int | None = None,
     validate_remaining_time: bool = True,
-    monotonic_tol_s: float = 1e-6,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Expand each order into per-update dynamic samples with remaining-time targets.
 
@@ -534,7 +578,6 @@ def build_dynamic_samples(
         lookback_steps=lookback_steps,
         lob_dim=lob_dim,
         tox_dim=tox_dim,
-        min_remaining_s=min_remaining_s,
         admin_censor_time=admin_censor_time,
         duration_col=duration_col,
         event_col=event_col,
@@ -547,7 +590,6 @@ def build_dynamic_samples(
         seq_len_col=seq_len_col,
         max_samples_per_order=max_samples_per_order,
         validate_remaining_time=validate_remaining_time,
-        monotonic_tol_s=monotonic_tol_s,
     )
     return materialize_dynamic_samples_from_manifest(order_store, manifest)
 
