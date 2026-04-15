@@ -1,0 +1,46 @@
+#!/bin/bash
+#SBATCH -p GPU-shared
+#SBATCH -t 1:00:00
+#SBATCH -N 1
+#SBATCH --gpus=v100-32:1
+#SBATCH -o logs/standardized_dynamic_deephit_loss_grid_search_aggregate.%j.out
+#SBATCH -e logs/standardized_dynamic_deephit_loss_grid_search_aggregate.%j.err
+#SBATCH -A cis260122p
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --no-requeue
+
+set -euo pipefail
+
+echo "Aggregation job $SLURM_JOB_ID starting on $(hostname)"
+mkdir -p logs
+cd "$SLURM_SUBMIT_DIR"
+
+# Ensure the repository root is on PYTHONPATH so `import src` works.
+export PYTHONPATH="$SLURM_SUBMIT_DIR:${PYTHONPATH:-}"
+
+echo "PYTHONPATH=$PYTHONPATH"
+
+# Activate the conda environment used interactively.
+if [ -f /opt/packages/anaconda3-2024.10-1/etc/profile.d/conda.sh ]; then
+  source /opt/packages/anaconda3-2024.10-1/etc/profile.d/conda.sh
+  conda activate lob
+else
+  echo "Conda init script not found; continuing without conda activation"
+fi
+
+echo "Python: $(which python) ; $(python -V)"
+
+ARRAY_JOB_ID="${1:-${ARRAY_JOB_ID:-}}"
+if [ -z "$ARRAY_JOB_ID" ]; then
+  echo "Usage: sbatch standardized_dynamic_deephit_loss_grid_search_aggregate.job <array_job_id>" >&2
+  echo "Or set ARRAY_JOB_ID in the environment." >&2
+  exit 2
+fi
+
+python scripts/aggregate_loss_grid_search_shards.py \
+  --repo-root "$SLURM_SUBMIT_DIR" \
+  --array-job-id "$ARRAY_JOB_ID" \
+  --expected-shards 100 \
+  --expected-rows 600
+
+echo "Aggregation complete for array job $ARRAY_JOB_ID"
