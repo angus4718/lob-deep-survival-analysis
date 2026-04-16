@@ -1,0 +1,123 @@
+#!/bin/bash
+#SBATCH -p GPU-shared
+#SBATCH -t 4:00:00
+#SBATCH -N 1
+#SBATCH -o logs/standardized_static_deephit_loss_grid_search.%A_%a.out
+#SBATCH -e logs/standardized_static_deephit_loss_grid_search.%A_%a.err
+#SBATCH --gpus=v100-32:1
+#SBATCH -A cis260122p
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --no-requeue
+#SBATCH --array=0-23
+
+set -euo pipefail
+
+echo "Job $SLURM_JOB_ID starting on $(hostname)"
+mkdir -p logs
+cd "$SLURM_SUBMIT_DIR"
+
+# Ensure the repository root is on PYTHONPATH so `import src` works when papermill runs.
+export PYTHONPATH="$SLURM_SUBMIT_DIR:${PYTHONPATH:-}"
+echo "PYTHONPATH=$PYTHONPATH"
+
+# Optional module loads; adjust/remove if not needed on your cluster.
+module purge
+module load gcc/13.2.1-p20240614 cuda/12.4.0 || true
+
+# Activate the conda environment used interactively.
+if [ -f /opt/packages/anaconda3-2024.10-1/etc/profile.d/conda.sh ]; then
+  source /opt/packages/anaconda3-2024.10-1/etc/profile.d/conda.sh
+  conda activate lob
+else
+  echo "Conda init script not found; continuing without conda activation"
+fi
+
+echo "Python: $(which python) ; $(python -V)"
+
+NOTEBOOK="notebooks/baseline_models/standardized_static_deephit_loss_grid_search.ipynb"
+
+# One task = one model x one ticker x one seed.
+MODELS=("mamba" "transformer" "gru" "gru_transformer")
+TICKERS=("AAPL" "INTC" "LCID")
+SEEDS=(4718 4819)
+
+NUM_MODELS=${#MODELS[@]}
+NUM_TICKERS=${#TICKERS[@]}
+NUM_SEEDS=${#SEEDS[@]}
+TASKS_PER_MODEL=$((NUM_TICKERS * NUM_SEEDS))
+TOTAL_TASKS=$((NUM_MODELS * TASKS_PER_MODEL))
+
+ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
+if (( ARRAY_TASK_ID < 0 || ARRAY_TASK_ID >= TOTAL_TASKS )); then
+  echo "SLURM_ARRAY_TASK_ID=$ARRAY_TASK_ID is out of range [0, $((TOTAL_TASKS - 1))]" >&2
+  exit 2
+fi
+
+MODEL_IDX=$((ARRAY_TASK_ID / TASKS_PER_MODEL))
+MODEL_TASK_IDX=$((ARRAY_TASK_ID % TASKS_PER_MODEL))
+TICKER_IDX=$((MODEL_TASK_IDX / NUM_SEEDS))
+SEED_IDX=$((MODEL_TASK_IDX % NUM_SEEDS))
+
+MODEL_NAME="${MODELS[$MODEL_IDX]}"
+TICKER_SYMBOL="${TICKERS[$TICKER_IDX]}"
+SEED_VALUE="${SEEDS[$SEED_IDX]}"
+
+ARRAY_JOB_ID="${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}"
+TASK_LABEL="${ARRAY_JOB_ID}_${ARRAY_TASK_ID}"
+
+# Use YAML parameters to preserve list types for notebook TICKERS/SEEDS.
+PARAMS_YAML="$(cat <<EOF
+model_name: "${MODEL_NAME}"
+TICKERS:
+  - "${TICKER_SYMBOL}"
+SEEDS:
+  - ${SEED_VALUE}
+selected_alpha: null
+selected_beta_l3: null
+array_job_id: "${ARRAY_JOB_ID}"
+array_task_id: ${ARRAY_TASK_ID}
+EOF
+)"
+
+OUTNOTEBOOK="notebooks/baseline_models/standardized_static_deephit_loss_grid_search.output.${TASK_LABEL}.${MODEL_NAME}.${TICKER_SYMBOL}.s${SEED_VALUE}.ipynb"
+OUTNOTEBOOK_DIR="$(dirname "$OUTNOTEBOOK")"
+LOGPREFIX="logs/standardized_static_deephit_loss_grid_search.${TASK_LABEL}.${MODEL_NAME}.${TICKER_SYMBOL}.s${SEED_VALUE}"
+
+echo "Task mapping: task_id=${ARRAY_TASK_ID}, model=${MODEL_NAME}, ticker=${TICKER_SYMBOL}, seed=${SEED_VALUE}"
+echo "Grid behavior: each task evaluates full alpha/beta grid in the notebook for its model/ticker/seed tuple."
+
+mkdir -p "$OUTNOTEBOOK_DIR"
+
+# Optional side log consumed by notebook code paths that honor NOTEBOOK_JOB_LOG.
+export NOTEBOOK_JOB_LOG="logs/notebook_static_${TASK_LABEL}_${MODEL_NAME}_${TICKER_SYMBOL}_s${SEED_VALUE}.log"
+touch "$NOTEBOOK_JOB_LOG"
+
+# Mirror notebook side-log into Slurm stdout for live monitoring.
+tail -n 0 -F "$NOTEBOOK_JOB_LOG" 2>/dev/null &
+NOTEBOOK_LOG_TAIL_PID=$!
+cleanup_tail() {
+  if [ -n "${NOTEBOOK_LOG_TAIL_PID:-}" ] && kill -0 "$NOTEBOOK_LOG_TAIL_PID" 2>/dev/null; then
+    kill "$NOTEBOOK_LOG_TAIL_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup_tail EXIT
+
+if command -v papermill >/dev/null 2>&1; then
+  echo "Using papermill to execute notebook..."
+  papermill "$NOTEBOOK" "$OUTNOTEBOOK" \
+    -y "$PARAMS_YAML" \
+    --log-output 2>&1 | tee "${LOGPREFIX}.papermill.log"
+  EXIT_CODE=${PIPESTATUS[0]}
+elif python -c "import papermill" >/dev/null 2>&1; then
+  echo "Using python -m papermill to execute notebook..."
+  python -m papermill "$NOTEBOOK" "$OUTNOTEBOOK" \
+    -y "$PARAMS_YAML" \
+    --log-output 2>&1 | tee "${LOGPREFIX}.papermill.log"
+  EXIT_CODE=${PIPESTATUS[0]}
+else
+  echo "papermill is required for parameterized execution but is not available." >&2
+  exit 3
+fi
+
+echo "Notebook finished with exit code $EXIT_CODE"
+exit $EXIT_CODE
