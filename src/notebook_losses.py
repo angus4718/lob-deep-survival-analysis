@@ -182,6 +182,80 @@ def l2_rank_order_avg(
     )
 
 
+def l2_rank_order_avg_from_cif_static(
+    cif: torch.Tensor,
+    y: torch.Tensor,
+    d: torch.Tensor,
+    order_ids: torch.Tensor,
+    *,
+    sigma: float = 0.1,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """L2 event-specific ranking loss with exact order-level averaging.
+
+    Static variant: pairwise comparisons are built across the batch with no
+    update-step slicing.
+    """
+    batch_size, num_events, num_bins = cif.shape
+    if batch_size == 0:
+        return torch.zeros((), device=cif.device, dtype=cif.dtype)
+
+    eps_val = float(eps)
+    if (not math.isfinite(eps_val)) or eps_val <= 0.0:
+        raise ValueError(f"eps must be finite and > 0. Got {eps!r}")
+    sigma_raw = float(sigma)
+    if (not math.isfinite(sigma_raw)) or sigma_raw <= 0.0:
+        raise ValueError(f"sigma must be finite and > 0. Got {sigma!r}")
+
+    tau = y.long().to(cif.device).clamp(0, num_bins - 1)
+    event_code = d.long().to(cif.device)
+    order_ids = order_ids.long().to(cif.device)
+
+    sigma_val = max(sigma_raw, eps_val)
+    sample_terms = torch.zeros(batch_size, device=cif.device, dtype=cif.dtype)
+
+    for event_id in range(1, num_events + 1):
+        anchors = torch.nonzero(event_code == event_id, as_tuple=False).squeeze(1)
+        if anchors.numel() == 0:
+            continue
+
+        for anchor_idx in anchors.tolist():
+            tau_anchor = tau[anchor_idx]
+            valid = (order_ids != order_ids[anchor_idx]) & (tau > tau_anchor)
+            if not torch.any(valid):
+                continue
+
+            j_idx = torch.nonzero(valid, as_tuple=False).squeeze(1)
+            f_i = cif[anchor_idx, event_id - 1, tau_anchor]
+            f_j = cif[j_idx, event_id - 1, tau_anchor]
+            pair_terms = torch.exp(-(f_i - f_j) / sigma_val)
+            sample_terms[anchor_idx] = sample_terms[anchor_idx] + pair_terms.sum()
+
+    return _order_average(sample_terms, order_ids)
+
+
+def l2_rank_order_avg_static(
+    logits: torch.Tensor,
+    y: torch.Tensor,
+    d: torch.Tensor,
+    order_ids: torch.Tensor,
+    *,
+    sigma: float = 0.1,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Static L2 event-specific ranking loss with exact order-level averaging."""
+    pmf = logits_to_pmf(logits)
+    cif = pmf_to_cif(pmf)
+    return l2_rank_order_avg_from_cif_static(
+        cif,
+        y,
+        d,
+        order_ids,
+        sigma=sigma,
+        eps=eps,
+    )
+
+
 def l3_aux_order_avg(
     base_net,
     x: torch.Tensor,
@@ -296,10 +370,59 @@ def dynamic_deephit_total_loss(
     return total, {"l1": l1, "l2": l2, "l3": l3}
 
 
+def static_deephit_total_loss(
+    logits: torch.Tensor,
+    y: torch.Tensor,
+    d: torch.Tensor,
+    order_ids: torch.Tensor,
+    x_batch: torch.Tensor,
+    base_net,
+    *,
+    alpha: float = 1.0,
+    sigma: float = 0.1,
+    beta_l3: float = 0.1,
+    aux_target_dim: int | None = None,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute static L_total = L1 + alpha * L2 + L3 with order averaging."""
+    alpha_val = float(alpha)
+    if (not math.isfinite(alpha_val)) or alpha_val < 0.0:
+        raise ValueError(f"alpha must be finite and >= 0. Got {alpha!r}")
+
+    eps_val = float(eps)
+    if (not math.isfinite(eps_val)) or eps_val <= 0.0:
+        raise ValueError(f"eps must be finite and > 0. Got {eps!r}")
+
+    pmf = logits_to_pmf(logits)
+    cif = pmf_to_cif(pmf)
+
+    l1 = l1_nll_order_avg_from_pmf(pmf, y, d, order_ids, eps=eps_val)
+    l2 = l2_rank_order_avg_from_cif_static(
+        cif,
+        y,
+        d,
+        order_ids,
+        sigma=sigma,
+        eps=eps_val,
+    )
+    l3 = l3_aux_order_avg(
+        base_net,
+        x_batch,
+        order_ids,
+        beta_l3=beta_l3,
+        aux_target_dim=aux_target_dim,
+    )
+
+    total = l1 + (alpha_val * l2) + l3
+    return total, {"l1": l1, "l2": l2, "l3": l3}
+
+
 __all__ = [
     "dynamic_deephit_total_loss",
+    "static_deephit_total_loss",
     "l1_nll_order_avg",
     "l2_rank_order_avg",
+    "l2_rank_order_avg_static",
     "l3_aux_order_avg",
     "logits_to_pmf",
     "pmf_to_cif",
