@@ -58,6 +58,7 @@ class DeepHitMambaCompeting(BaseDeepHitCompetingModel):
         d_conv: int = 4,
         expand: int = 2,
         mamba_dropout: float = 0.15,
+        fc_hidden: int = 192,
         fc_dropout: float = 0.2,
     ) -> None:
         super().__init__(num_events=num_events, num_time_steps=num_time_steps)
@@ -86,7 +87,6 @@ class DeepHitMambaCompeting(BaseDeepHitCompetingModel):
         self.attn_key_proj = nn.Linear(hidden_size, hidden_size)
         self.attn_scale = 1.0 / (hidden_size ** 0.5)
 
-        fc_hidden = 224 if hidden_size >= 160 else (192 if hidden_size >= 144 else 160)
         self.cause_heads = self._build_cause_specific_heads(
             input_size=hidden_size,
             hidden_size=fc_hidden,
