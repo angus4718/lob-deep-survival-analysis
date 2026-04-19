@@ -1,0 +1,159 @@
+#!/bin/bash
+#SBATCH -p GPU-shared
+#SBATCH -t 1:00:00
+#SBATCH -N 1
+#SBATCH -o logs/standardized_static_deephit_arch_grid_search.%A_%a.out
+#SBATCH -e logs/standardized_static_deephit_arch_grid_search.%A_%a.err
+#SBATCH --gpus=v100-32:1
+#SBATCH -A cis260122p
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --no-requeue
+
+set -eo pipefail
+
+echo "Job $SLURM_JOB_ID starting on $(hostname)"
+mkdir -p logs
+cd "$SLURM_SUBMIT_DIR"
+
+export PYTHONPATH="$SLURM_SUBMIT_DIR:${PYTHONPATH:-}"
+echo "PYTHONPATH=$PYTHONPATH"
+
+module purge
+
+# Load only modules that actually exist on this cluster.
+# Check with: module spider gcc ; module spider cuda
+if module spider cuda >/dev/null 2>&1; then
+  module load cuda || true
+fi
+
+if [ -f /opt/packages/anaconda3-2024.10-1/etc/profile.d/conda.sh ]; then
+  source /opt/packages/anaconda3-2024.10-1/etc/profile.d/conda.sh
+  conda activate lob
+else
+  echo "Conda init script not found; continuing without conda activation"
+fi
+
+echo "Python: $(which python) ; $(python -V)"
+
+NOTEBOOK="${NOTEBOOK_PATH:-notebooks/baseline_models/standardized_static_deephit_arch_grid_search.ipynb}"
+CONFIG_JSONL_PATH="${CONFIG_JSONL_PATH:-$SLURM_SUBMIT_DIR/model_configs/deephit_configs_param_200k_500k_v1.jsonl}"
+
+if [ ! -f "$CONFIG_JSONL_PATH" ]; then
+  echo "Missing config JSONL: $CONFIG_JSONL_PATH" >&2
+  exit 2
+fi
+
+NUM_CONFIGS=$(python - <<PY
+import json
+count = 0
+with open("$CONFIG_JSONL_PATH", "r", encoding="utf-8") as f:
+    for line in f:
+        if line.strip():
+            json.loads(line)
+            count += 1
+print(count)
+PY
+)
+
+TICKERS=("AAPL" "INTC" "LCID")
+SEEDS=(4718 4819)
+
+NUM_TICKERS=${#TICKERS[@]}
+NUM_SEEDS=${#SEEDS[@]}
+TOTAL_TASKS=$((NUM_CONFIGS * NUM_TICKERS * NUM_SEEDS))
+
+if [ "$TOTAL_TASKS" -le 0 ]; then
+  echo "No tasks available." >&2
+  exit 2
+fi
+
+ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
+if (( ARRAY_TASK_ID < 0 || ARRAY_TASK_ID >= TOTAL_TASKS )); then
+  echo "SLURM_ARRAY_TASK_ID=$ARRAY_TASK_ID is out of range [0, $((TOTAL_TASKS - 1))]" >&2
+  exit 2
+fi
+
+SELECTED_CONFIG_INDEX=$(( ARRAY_TASK_ID / (NUM_TICKERS * NUM_SEEDS) ))
+REM=$(( ARRAY_TASK_ID % (NUM_TICKERS * NUM_SEEDS) ))
+SELECTED_TICKER_INDEX=$(( REM / NUM_SEEDS ))
+SELECTED_SEED_INDEX=$(( REM % NUM_SEEDS ))
+
+SELECTED_TICKER="${TICKERS[$SELECTED_TICKER_INDEX]}"
+SELECTED_SEED="${SEEDS[$SELECTED_SEED_INDEX]}"
+SELECTED_CONFIG_ID=$(python - <<PY
+import json
+idx = int("$SELECTED_CONFIG_INDEX")
+with open("$CONFIG_JSONL_PATH", "r", encoding="utf-8") as f:
+    rows = [json.loads(line) for line in f if line.strip()]
+print(rows[idx]["config_id"])
+PY
+)
+
+ARRAY_JOB_ID="${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}"
+TASK_LABEL="${ARRAY_JOB_ID}_${ARRAY_TASK_ID}"
+
+OUTNOTEBOOK="notebooks/baseline_models/standardized_static_deephit_arch_grid_search.output.${TASK_LABEL}.ipynb"
+OUTNOTEBOOK_DIR="$(dirname "$OUTNOTEBOOK")"
+LOGPREFIX="logs/standardized_static_deephit_arch_grid_search.${TASK_LABEL}"
+
+echo "Task mapping: task_id=${ARRAY_TASK_ID}, config_index=${SELECTED_CONFIG_INDEX}, config_id=${SELECTED_CONFIG_ID}, ticker=${SELECTED_TICKER}, seed=${SELECTED_SEED}"
+
+mkdir -p "$OUTNOTEBOOK_DIR"
+
+export NOTEBOOK_JOB_LOG="logs/notebook_static_arch_${TASK_LABEL}.log"
+echo "NOTEBOOK_JOB_LOG=$NOTEBOOK_JOB_LOG"
+touch "$NOTEBOOK_JOB_LOG"
+
+tail -n 0 -F "$NOTEBOOK_JOB_LOG" 2>/dev/null &
+NOTEBOOK_LOG_TAIL_PID=$!
+cleanup_tail() {
+  if [ -n "${NOTEBOOK_LOG_TAIL_PID:-}" ] && kill -0 "$NOTEBOOK_LOG_TAIL_PID" 2>/dev/null; then
+    kill "$NOTEBOOK_LOG_TAIL_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup_tail EXIT
+
+PAPERMILL_ARGS=(
+  -p CONFIG_JSONL_PATH "$CONFIG_JSONL_PATH"
+  -p selected_config_index "$SELECTED_CONFIG_INDEX"
+  -p selected_config_id "$SELECTED_CONFIG_ID"
+  -p array_job_id "$ARRAY_JOB_ID"
+  -p array_task_id "$ARRAY_TASK_ID"
+  -p selected_ticker_index "$SELECTED_TICKER_INDEX"
+  -p selected_seed_index "$SELECTED_SEED_INDEX"
+)
+
+if [[ -n "${WANDB_MODE_OVERRIDE:-}" ]]; then
+  PAPERMILL_ARGS+=(-p WANDB_MODE "$WANDB_MODE_OVERRIDE")
+fi
+if [[ -n "${NUM_EPOCHS_OVERRIDE:-}" ]]; then
+  PAPERMILL_ARGS+=(-p num_epochs "$NUM_EPOCHS_OVERRIDE")
+fi
+if [[ -n "${LEARNING_RATE_OVERRIDE:-}" ]]; then
+  PAPERMILL_ARGS+=(-p LEARNING_RATE "$LEARNING_RATE_OVERRIDE")
+fi
+
+if command -v papermill >/dev/null 2>&1; then
+  echo "Using papermill to execute notebook..."
+  papermill "$NOTEBOOK" "$OUTNOTEBOOK" \
+    "${PAPERMILL_ARGS[@]}" \
+    --log-output 2>&1 | tee "${LOGPREFIX}.papermill.log"
+  EXIT_CODE=${PIPESTATUS[0]}
+elif python -c "import papermill" >/dev/null 2>&1; then
+  echo "Using python -m papermill to execute notebook..."
+  python -m papermill "$NOTEBOOK" "$OUTNOTEBOOK" \
+    "${PAPERMILL_ARGS[@]}" \
+    --log-output 2>&1 | tee "${LOGPREFIX}.papermill.log"
+  EXIT_CODE=${PIPESTATUS[0]}
+else
+  echo "Papermill not available; using nbconvert ExecutePreprocessor without parameter injection support." >&2
+  echo "Please install papermill for array-job execution." >&2
+  exit 3
+fi
+
+if (( EXIT_CODE != 0 )); then
+  echo "Notebook execution failed with exit code $EXIT_CODE" >&2
+  exit "$EXIT_CODE"
+fi
+
+echo "Notebook execution completed successfully for config_id=${SELECTED_CONFIG_ID}"
