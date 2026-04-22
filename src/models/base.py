@@ -36,6 +36,7 @@ class BaseDeepHitCompetingModel(nn.Module, ABC):
         activation: str = "relu",
         use_batch_norm: bool = True,
     ) -> nn.ModuleList:
+        hidden_size = int(hidden_size)
         layers: list[nn.Sequential] = []
         for _ in range(self.num_events):
             modules: list[nn.Module] = [nn.Linear(input_size, hidden_size)]
