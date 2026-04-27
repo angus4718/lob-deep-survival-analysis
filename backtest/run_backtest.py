@@ -21,22 +21,22 @@ except ImportError:
 
 
 DEFAULT_ARTIFACT_BASE_NET = Path(
-    "/ocean/projects/cis260122p/shared/artifacts/baseline/standardized_deephit_gru_transformer_base_net.pt"
+    "/ocean/projects/cis260122p/shared/artifacts/baseline/standardized_deephit_transformer_base_net.pt"
 )
 DEFAULT_ARTIFACT_META = Path(
-    "/ocean/projects/cis260122p/shared/artifacts/baseline/standardized_deephit_gru_transformer_meta.pt"
+    "/ocean/projects/cis260122p/shared/artifacts/baseline/standardized_deephit_transformer_meta.pt"
 )
 DEFAULT_DATASET = Path(
     "/ocean/projects/cis260122p/shared/data/datasets/labeled_dataset_XNAS_ITCH_AAPL_mbo_20251001_20260101.parquet"
 )
 DEFAULT_OUTPUT_DIR = Path(
-    "/ocean/projects/cis260122p/hwang71/backtest/outputs/output_standardized_deephit_gru_transformer"
+    "/ocean/projects/cis260122p/hwang71/backtest/outputs/output_standardized_deephit_transformer"
 )
 DEFAULT_PROJECT_ROOT = Path("/ocean/projects/cis260122p/hwang71/lob-deep-survival-analysis-main")
 DEFAULT_MAX_TIME_S = 60.0
 DEFAULT_HORIZON_S = 60.0
 DEFAULT_RISK_AVERSION = 1.0
-DEFAULT_DECISION_THRESHOLD = 0.6                                                                                                                                                                                    
+DEFAULT_DECISION_THRESHOLD = 0.0
 
 
 def parse_args() -> argparse.Namespace:

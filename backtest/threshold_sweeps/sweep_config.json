@@ -1,0 +1,40 @@
+{
+  "artifact_dir": "/ocean/projects/cis260122p/shared/artifacts/baseline",
+  "dataset": "/ocean/projects/cis260122p/shared/data/datasets/labeled_dataset_XNAS_ITCH_AAPL_mbo_20251001_20260101.parquet",
+  "project_root": "/ocean/projects/cis260122p/hwang71/lob-deep-survival-analysis-main",
+  "output_dir": "/ocean/projects/cis260122p/hwang71/backtest/threshold_sweeps",
+  "artifact_pattern": "standardized_deephit_*_base_net.pt",
+  "exclude_model_names": [
+    "mamba"
+  ],
+  "thresholds": [
+    0.0,
+    0.05,
+    0.1,
+    0.15,
+    0.2,
+    0.25,
+    0.3,
+    0.35,
+    0.4,
+    0.5,
+    0.6
+  ],
+  "selection_split": "val",
+  "horizon_s": 60.0,
+  "max_time_s": 60.0,
+  "risk_aversion": 1.0,
+  "cancel_rate_cap": 0.2,
+  "strategies": [
+    "model",
+    "always_market",
+    "always_limit",
+    "training_prior"
+  ],
+  "markout_window_ms": null,
+  "cleanup_price_mode": "entry_quote",
+  "market_future_mid_mode": "entry_mid",
+  "cleanup_future_mid_mode": "entry_mid",
+  "device": "cpu",
+  "batch_size": 1024
+}

@@ -1,0 +1,17 @@
+{
+  "standardized_deephit_gru": {
+    "selected_threshold": 0.0,
+    "artifact_base_net": "/ocean/projects/cis260122p/shared/artifacts/baseline/standardized_deephit_gru_base_net.pt",
+    "artifact_meta": "/ocean/projects/cis260122p/shared/artifacts/baseline/standardized_deephit_gru_meta.pt"
+  },
+  "standardized_deephit_gru_transformer": {
+    "selected_threshold": 0.15,
+    "artifact_base_net": "/ocean/projects/cis260122p/shared/artifacts/baseline/standardized_deephit_gru_transformer_base_net.pt",
+    "artifact_meta": "/ocean/projects/cis260122p/shared/artifacts/baseline/standardized_deephit_gru_transformer_meta.pt"
+  },
+  "standardized_deephit_transformer": {
+    "selected_threshold": 0.0,
+    "artifact_base_net": "/ocean/projects/cis260122p/shared/artifacts/baseline/standardized_deephit_transformer_base_net.pt",
+    "artifact_meta": "/ocean/projects/cis260122p/shared/artifacts/baseline/standardized_deephit_transformer_meta.pt"
+  }
+}

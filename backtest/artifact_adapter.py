@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import pickle
+import re
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -51,6 +52,7 @@ STANDARDIZED_MODEL_CONFIGS: dict[str, dict[str, Any]] = {
         "d_conv": 4,
         "expand": 2,
         "mamba_dropout": 0.15,
+        "fc_hidden": 192,
         "fc_dropout": 0.2,
     },
 }
@@ -132,15 +134,13 @@ def load_artifact(
     artifact_meta_path = artifact_meta_path.resolve()
 
     meta = _load_metadata(artifact_meta_path)
+    state_dict = torch.load(artifact_base_net_path, map_location="cpu", weights_only=True)
+
     model_cls = _resolve_model_class(project_root, meta.model_name)
-
-    init_kwargs = _resolve_model_init_kwargs(meta, feature_dim)
+    init_kwargs = _resolve_model_init_kwargs(meta, feature_dim, state_dict)
     model = model_cls(**init_kwargs)
-
-    state_dict = torch.load(artifact_base_net_path, map_location="cpu")
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    print("Missing keys:", missing_keys)
-    print("Unexpected keys:", unexpected_keys)
+    model.load_state_dict(state_dict, strict=True)
+    print("Loaded artifact state_dict with strict=True")
 
     torch_device = torch.device(device)
     model.to(torch_device)
@@ -164,7 +164,19 @@ def load_artifact_metadata(meta_path: Path) -> ArtifactMetadata:
 def _load_metadata(meta_path: Path) -> ArtifactMetadata:
     stem = meta_path.stem
     with zipfile.ZipFile(meta_path) as zf:
-        payload = zf.read(f"{stem}/data.pkl")
+        candidate_names = (f"{stem}/data.pkl", "archive/data.pkl")
+        payload = None
+        for candidate in candidate_names:
+            try:
+                payload = zf.read(candidate)
+                break
+            except KeyError:
+                continue
+        if payload is None:
+            raise KeyError(
+                f"Could not find metadata payload in {meta_path}. "
+                f"Tried: {', '.join(candidate_names)}"
+            )
     raw = pickle.load(io.BytesIO(payload))
 
     time_grid = np.asarray(raw["time_grid"], dtype=np.float32)
@@ -217,13 +229,20 @@ def _resolve_model_class(project_root: Path, model_name: str):
     return registry[model_name]
 
 
-def _resolve_model_init_kwargs(meta: ArtifactMetadata, feature_dim: int) -> dict[str, Any]:
+def _resolve_model_init_kwargs(
+    meta: ArtifactMetadata,
+    feature_dim: int,
+    state_dict: dict[str, torch.Tensor] | None = None,
+) -> dict[str, Any]:
     if meta.model_name not in STANDARDIZED_MODEL_CONFIGS:
         raise ValueError(
             f"No standardized config known for model_name {meta.model_name!r}."
         )
 
     kwargs = dict(STANDARDIZED_MODEL_CONFIGS[meta.model_name])
+    kwargs.update(_extract_config_from_metadata(meta))
+    if state_dict is not None:
+        kwargs.update(_infer_config_from_state_dict(meta.model_name, state_dict))
     kwargs["num_features"] = feature_dim
     kwargs["num_events"] = meta.num_competing_events
     kwargs["num_time_steps"] = meta.output_steps
@@ -232,6 +251,106 @@ def _resolve_model_init_kwargs(meta: ArtifactMetadata, feature_dim: int) -> dict
         kwargs["max_seq_len"] = meta.lookback_steps
 
     return kwargs
+
+
+def _extract_config_from_metadata(meta: ArtifactMetadata) -> dict[str, Any]:
+    if not meta.raw:
+        return {}
+
+    allowed = {
+        "hidden_size",
+        "num_layers",
+        "rnn_dropout",
+        "fc_hidden",
+        "fc_dropout",
+        "transformer_layers",
+        "transformer_heads",
+        "transformer_ff_dim",
+        "transformer_dropout",
+        "num_heads",
+        "max_seq_len",
+        "num_mamba_layers",
+        "d_state",
+        "d_conv",
+        "expand",
+        "mamba_dropout",
+    }
+    return {key: meta.raw[key] for key in allowed if meta.raw.get(key) is not None}
+
+
+def _infer_config_from_state_dict(
+    model_name: str,
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, Any]:
+    if model_name == "gru":
+        hidden_size = state_dict["rnn.weight_ih_l0"].shape[0] // 3
+        return {
+            "hidden_size": int(hidden_size),
+            "num_layers": _count_indexed_layers(state_dict, r"^rnn\.weight_ih_l(\d+)$"),
+            "fc_hidden": int(state_dict["cause_specific_heads.0.0.weight"].shape[0]),
+        }
+
+    if model_name == "transformer":
+        return {
+            "hidden_size": int(state_dict["input_projection.weight"].shape[0]),
+            "num_layers": _count_indexed_layers(
+                state_dict, r"^transformer\.layers\.(\d+)\."
+            ),
+            "transformer_ff_dim": int(
+                state_dict["transformer.layers.0.linear1.weight"].shape[0]
+            ),
+            "fc_hidden": int(state_dict["cause_specific_heads.0.0.weight"].shape[0]),
+            "max_seq_len": int(state_dict["positional_embedding"].shape[1]),
+        }
+
+    if model_name == "gru_transformer":
+        hidden_size = state_dict["rnn.weight_ih_l0"].shape[0] // 3
+        return {
+            "hidden_size": int(hidden_size),
+            "num_layers": _count_indexed_layers(state_dict, r"^rnn\.weight_ih_l(\d+)$"),
+            "transformer_layers": _count_indexed_layers(
+                state_dict, r"^transformer\.layers\.(\d+)\."
+            ),
+            "transformer_ff_dim": int(
+                state_dict["transformer.layers.0.linear1.weight"].shape[0]
+            ),
+            "fc_hidden": int(state_dict["cause_specific_heads.0.0.weight"].shape[0]),
+            "max_seq_len": int(state_dict["positional_embedding"].shape[1]),
+        }
+
+    if model_name == "mamba":
+        inferred = {
+            "hidden_size": int(state_dict["input_proj.weight"].shape[0]),
+            "num_mamba_layers": _count_indexed_layers(
+                state_dict, r"^ssm_layers\.(\d+)\."
+            ),
+            "fc_hidden": int(state_dict["cause_heads.0.0.weight"].shape[0]),
+        }
+        a_log = state_dict.get("ssm_layers.0.block.A_log")
+        if a_log is not None:
+            inferred["d_state"] = int(a_log.shape[-1])
+        conv_weight = state_dict.get("ssm_layers.0.block.conv1d.weight")
+        if conv_weight is not None:
+            inferred["d_conv"] = int(conv_weight.shape[-1])
+        in_proj = state_dict.get("ssm_layers.0.block.in_proj.weight")
+        hidden_size = inferred["hidden_size"]
+        if in_proj is not None and hidden_size > 0:
+            inferred["expand"] = int(in_proj.shape[0] // (2 * hidden_size))
+        return inferred
+
+    return {}
+
+
+def _count_indexed_layers(state_dict: dict[str, torch.Tensor], pattern: str) -> int:
+    regex = re.compile(pattern)
+    indices = {
+        int(match.group(1))
+        for key in state_dict
+        if (match := regex.match(key)) is not None
+    }
+    if not indices:
+        return 1
+    return max(indices) + 1
 
 
 def _logits_to_pmf(logits: torch.Tensor) -> torch.Tensor:

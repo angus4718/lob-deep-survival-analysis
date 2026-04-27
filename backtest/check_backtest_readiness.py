@@ -40,7 +40,10 @@ OPTIONAL_MODEL_MODULES = {
 }
 
 STANDARDIZED_NOTEBOOK_REL = Path("notebooks/baseline_models/standardized_static_deephit.ipynb")
-EXPECTED_DATASET_NAME = "labeled_dataset_XNAS_ITCH_AAPL_mbo_20251001_20260101_equal.parquet"
+EXPECTED_DATASET_NAME = "labeled_dataset_XNAS_ITCH_AAPL_mbo_20251001_20260101.parquet"
+LEGACY_DATASET_NAMES = (
+    "labeled_dataset_XNAS_ITCH_AAPL_mbo_20251001_20260101_equal.parquet",
+)
 
 
 @dataclass
@@ -122,15 +125,28 @@ def _load_notebook_dataset_hint(project_root: Path) -> CheckResult:
         return CheckResult(False, f"Failed to parse notebook JSON: {exc}")
 
     dataset_mentions = []
+    legacy_mentions = set()
     for cell in nb.get("cells", []):
         src = "".join(cell.get("source", []))
         if EXPECTED_DATASET_NAME in src:
             dataset_mentions.append(src)
+        for legacy_name in LEGACY_DATASET_NAMES:
+            if legacy_name in src:
+                legacy_mentions.add(legacy_name)
 
     if not dataset_mentions:
+        if legacy_mentions:
+            legacy_list = ", ".join(sorted(legacy_mentions))
+            return CheckResult(
+                True,
+                "Notebook still references legacy dataset name(s) "
+                f"{legacy_list}; readiness now validates the current PSC dataset "
+                f"{EXPECTED_DATASET_NAME}.",
+            )
         return CheckResult(
-            False,
-            f"Notebook does not reference expected dataset {EXPECTED_DATASET_NAME}",
+            True,
+            f"Notebook does not reference expected dataset {EXPECTED_DATASET_NAME}; "
+            "using the current backtest CLI dataset contract instead.",
         )
     return CheckResult(
         True,
@@ -205,6 +221,13 @@ def evaluate_readiness(project_root: Path, artifacts_dir: Path, data_dir: Path) 
     }
     if not notebook_check.ok:
         results["blocking_issues"].append(notebook_check.message)
+    else:
+        notebook_hint_is_warning = (
+            "legacy dataset" in notebook_check.message
+            or "does not reference expected dataset" in notebook_check.message
+        )
+        if notebook_hint_is_warning:
+            results["warnings"].append(notebook_check.message)
 
     labeled_dataset = data_dir / "datasets" / EXPECTED_DATASET_NAME
     if not labeled_dataset.exists():
@@ -242,8 +265,9 @@ def evaluate_readiness(project_root: Path, artifacts_dir: Path, data_dir: Path) 
         "or extend the artifact format to save preprocessing statistics."
     )
     results["assumptions"].append(
-        "The current repository does not include a reusable static backtest CLI; "
-        "the workflow still lives in notebooks plus data-generation scripts."
+        "The current repository includes reusable static backtest CLIs: "
+        "`python -m backtest.run_backtest` and `python -m backtest.threshold_sweep`; "
+        "this checker validates artifacts, datasets, and dependencies before use."
     )
 
     overall_ready = len(results["blocking_issues"]) == 0
@@ -303,6 +327,8 @@ def print_human_summary(report: dict[str, Any]) -> None:
     print("Assumptions / warnings")
     for item in report["assumptions"]:
         print(f"  - {item}")
+    for item in report["warnings"]:
+        print(f"  - WARNING: {item}")
     print()
 
     if report["blocking_issues"]:
