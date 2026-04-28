@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.utils.checkpoint
 from torch import nn
 
 from .base import BaseDeepHitCompetingModel, masked_attention_pooling
@@ -89,7 +90,15 @@ class DeepHitTransformerCompeting(BaseDeepHitCompetingModel):
         pad_lens = seq_len - seq_lens.unsqueeze(1)
         padding_mask = positions < pad_lens
 
-        tr_out = self.transformer(tr_in, src_key_padding_mask=padding_mask)
+        if self.training:
+            tr_out = torch.utils.checkpoint.checkpoint(
+                self.transformer,
+                tr_in,
+                use_reentrant=False,
+                src_key_padding_mask=padding_mask,
+            )
+        else:
+            tr_out = self.transformer(tr_in, src_key_padding_mask=padding_mask)
         self.latest_transformer_output = tr_out
 
         self._cache = {
