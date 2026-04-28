@@ -47,7 +47,7 @@ class DeepHitTransformerCompeting(BaseDeepHitCompetingModel):
             batch_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.pre_transformer_norm = nn.LayerNorm(hidden_size)
+        self.pre_encoder_norm = nn.LayerNorm(hidden_size)
 
         self.attn_query_proj = nn.Linear(hidden_size, hidden_size)
         self.attn_key_proj = nn.Linear(hidden_size, hidden_size)
@@ -57,7 +57,7 @@ class DeepHitTransformerCompeting(BaseDeepHitCompetingModel):
             input_size=hidden_size,
             hidden_size=fc_hidden,
             dropout=fc_dropout,
-            activation="relu",
+            activation="gelu",
             use_batch_norm=True,
         )
 
@@ -82,7 +82,7 @@ class DeepHitTransformerCompeting(BaseDeepHitCompetingModel):
         input_proj_residual = self.input_proj_residual(last_input)
 
         x_with_pos = x_proj + self.positional_embedding[:, :seq_len, :]
-        tr_in = self.pre_transformer_norm(x_with_pos)
+        tr_in = self.pre_encoder_norm(x_with_pos)
 
         seq_lens = mask.sum(dim=1).long().clamp(min=1)
         positions = torch.arange(seq_len, device=x.device).unsqueeze(0)

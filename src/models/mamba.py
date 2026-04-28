@@ -66,7 +66,7 @@ class DeepHitMambaCompeting(BaseDeepHitCompetingModel):
         self.num_features = num_features
         self.hidden_size = hidden_size
 
-        self.input_proj = nn.Linear(num_features, hidden_size)
+        self.input_projection = nn.Linear(num_features, hidden_size)
         self.input_proj_residual = nn.Linear(num_features, hidden_size)
 
         self.ssm_layers = nn.ModuleList(
@@ -81,7 +81,6 @@ class DeepHitMambaCompeting(BaseDeepHitCompetingModel):
                 for _ in range(num_mamba_layers)
             ]
         )
-        self.output_norm = nn.LayerNorm(hidden_size)
 
         self.attn_query_proj = nn.Linear(hidden_size, hidden_size)
         self.attn_key_proj = nn.Linear(hidden_size, hidden_size)
@@ -92,7 +91,7 @@ class DeepHitMambaCompeting(BaseDeepHitCompetingModel):
             hidden_size=fc_hidden,
             dropout=fc_dropout,
             activation="gelu",
-            use_batch_norm=False,
+            use_batch_norm=True,
         )
 
         self.pred_dim = num_features - 1
@@ -106,7 +105,7 @@ class DeepHitMambaCompeting(BaseDeepHitCompetingModel):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mask, lengths = self._lengths_from_mask(x)
-        h = self.input_proj(x)
+        h = self.input_projection(x)
         last_input_proj = self.input_proj_residual(x[:, -1, :])
 
         for layer in self.ssm_layers:
@@ -114,7 +113,6 @@ class DeepHitMambaCompeting(BaseDeepHitCompetingModel):
                 h = checkpoint(layer, h, use_reentrant=False)
             else:
                 h = layer(h)
-        h = self.output_norm(h)
 
         query = self.attn_query_proj(last_input_proj)
         seq_repr = masked_attention_pooling(

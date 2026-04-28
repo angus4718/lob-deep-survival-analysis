@@ -25,15 +25,17 @@ class DeepHitRNNCompeting(BaseDeepHitCompetingModel):
         super().__init__(num_events=num_events, num_time_steps=num_time_steps)
         self.hidden_size = hidden_size
 
+        self.input_projection = nn.Linear(num_features, hidden_size)
+        self.pre_encoder_norm = nn.LayerNorm(hidden_size)
+
         self.rnn = nn.GRU(
-            input_size=num_features,
+            input_size=hidden_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
             dropout=rnn_dropout if num_layers > 1 else 0.0,
             bidirectional=False,
         )
-        self.output_norm = nn.LayerNorm(hidden_size)
 
         self.attn_query_proj = nn.Linear(hidden_size, hidden_size)
         self.attn_key_proj = nn.Linear(hidden_size, hidden_size)
@@ -44,7 +46,7 @@ class DeepHitRNNCompeting(BaseDeepHitCompetingModel):
             input_size=hidden_size,
             hidden_size=fc_hidden,
             dropout=fc_dropout,
-            activation="relu",
+            activation="gelu",
             use_batch_norm=True,
         )
 
@@ -60,8 +62,8 @@ class DeepHitRNNCompeting(BaseDeepHitCompetingModel):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Mask is expected as the final channel: valid timestep if value > 0.5.
         mask, lengths = self._lengths_from_mask(x)
-        rnn_out, _ = self.rnn(x)  # (batch, seq_len, hidden)
-        rnn_out = self.output_norm(rnn_out)
+        x_proj = self.pre_encoder_norm(self.input_projection(x))
+        rnn_out, _ = self.rnn(x_proj)  # (batch, seq_len, hidden)
 
         last_input = x[:, -1, :]  # (batch, num_features)
         input_proj = self.input_proj_residual(last_input)  # (batch, hidden)

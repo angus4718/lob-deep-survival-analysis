@@ -33,8 +33,11 @@ class DeepHitRNNTransformerCompeting(BaseDeepHitCompetingModel):
 
         self.max_seq_len = max_seq_len
 
+        self.input_projection = nn.Linear(num_features, hidden_size)
+        self.pre_gru_norm = nn.LayerNorm(hidden_size)
+
         self.rnn = nn.GRU(
-            input_size=num_features,
+            input_size=hidden_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
@@ -65,7 +68,7 @@ class DeepHitRNNTransformerCompeting(BaseDeepHitCompetingModel):
             input_size=hidden_size,
             hidden_size=fc_hidden,
             dropout=fc_dropout,
-            activation="relu",
+            activation="gelu",
             use_batch_norm=True,
         )
 
@@ -88,7 +91,8 @@ class DeepHitRNNTransformerCompeting(BaseDeepHitCompetingModel):
         last_input = x[:, -1, :]
         input_proj = self.input_proj_residual(last_input)
 
-        rnn_out, _ = self.rnn(x)
+        x_proj = self.pre_gru_norm(self.input_projection(x))
+        rnn_out, _ = self.rnn(x_proj)
         tr_in = self.pre_transformer_norm(rnn_out + self.positional_embedding[:, :seq_len, :])
 
         seq_lens = mask.sum(dim=1).long().clamp(min=1)
