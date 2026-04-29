@@ -29,6 +29,8 @@ class ResidualMambaBlock(nn.Module):
         if MambaBlock is None:
             raise ImportError(
                 "mamba_ssm is required for DeepHitMambaCompeting. "
+                "Install it with `pip install mamba-ssm` and ensure any optional "
+                "dependencies required by your environment are available."
             )
         self.norm = nn.LayerNorm(hidden_size)
         self.block = MambaBlock(
