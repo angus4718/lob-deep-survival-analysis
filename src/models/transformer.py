@@ -42,9 +42,10 @@ class DeepHitTransformerCompeting(BaseDeepHitCompetingModel):
             dropout=transformer_dropout,
             activation="gelu",
             batch_first=True,
+            norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.pre_encoder_norm = nn.LayerNorm(hidden_size)
+        self.post_transformer_norm = nn.LayerNorm(hidden_size)
         self.latest_transformer_output: torch.Tensor | None = None
 
     def encode(
@@ -55,7 +56,7 @@ class DeepHitTransformerCompeting(BaseDeepHitCompetingModel):
             raise ValueError(f"Sequence length {seq_len} exceeds max_seq_len={self.max_seq_len}.")
 
         x_with_pos = x_proj + self.positional_embedding[:, :seq_len, :]
-        tr_in = self.pre_encoder_norm(x_with_pos)
+        tr_in = x_with_pos
 
         positions = torch.arange(seq_len, device=x_proj.device).unsqueeze(0)
         pad_lens = seq_len - lengths.unsqueeze(1)
@@ -71,5 +72,6 @@ class DeepHitTransformerCompeting(BaseDeepHitCompetingModel):
         else:
             tr_out = self.transformer(tr_in, src_key_padding_mask=padding_mask)
 
+        tr_out = self.post_transformer_norm(tr_out)
         self.latest_transformer_output = tr_out
         return tr_out

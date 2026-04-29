@@ -63,6 +63,7 @@ class DeepHitMambaCompeting(BaseDeepHitCompetingModel):
         fc_dropout: float = 0.2,
     ) -> None:
         super().__init__(num_features, num_events, num_time_steps, hidden_size, fc_hidden, fc_dropout)
+        self.post_mamba_norm = nn.LayerNorm(hidden_size)
         self.ssm_layers = nn.ModuleList(
             [
                 ResidualMambaBlock(
@@ -85,4 +86,4 @@ class DeepHitMambaCompeting(BaseDeepHitCompetingModel):
                 h = checkpoint(layer, h, use_reentrant=False)
             else:
                 h = layer(h)
-        return h
+        return self.post_mamba_norm(h)
