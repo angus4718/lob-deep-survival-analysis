@@ -58,7 +58,6 @@ class DeepHitRNNTransformerCompeting(BaseDeepHitCompetingModel):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=transformer_layers)
         self.post_transformer_norm = nn.LayerNorm(hidden_size)
-        self.latest_transformer_output: torch.Tensor | None = None
 
     def encode(
         self, x_proj: torch.Tensor, _mask: torch.Tensor, lengths: torch.Tensor
@@ -85,5 +84,4 @@ class DeepHitRNNTransformerCompeting(BaseDeepHitCompetingModel):
         else:
             tr_out = self.transformer(tr_in, src_key_padding_mask=padding_mask)
         tr_out = self.post_transformer_norm(tr_out)
-        self.latest_transformer_output = tr_out
         return tr_out

@@ -9,7 +9,7 @@ Consistent with EventType enum in domain/enums.py.
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from .base import BaseLabeler
 from ..domain.enums import EventType
@@ -25,10 +25,10 @@ class ExecutionCompetingRisksLabeler(BaseLabeler):
     - Toxic fill identification via spread-relative heuristics
     """
 
-    tox_bps: float = None
-    tox_spread_bps: float = None
-    tox_duration_s: float = None
-    selected_window: int = None
+    tox_bps: Optional[float] = None
+    tox_spread_bps: Optional[float] = None
+    tox_duration_s: Optional[float] = None
+    selected_window: Optional[int] = None
 
     def __post_init__(self):
         if self.tox_bps is None:

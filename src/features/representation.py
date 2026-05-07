@@ -201,7 +201,7 @@ class RepresentationTransform(BaseLOBTransform):
             ask_vol = asks.get(price, 0.0)
             bid_vol = bids.get(price, 0.0)
             signed = ask_vol - bid_vol
-            values.append(self._encode_signed_size(signed))
+            values.append(signed)
         return values
 
     def _market_depth(
@@ -219,8 +219,8 @@ class RepresentationTransform(BaseLOBTransform):
             bid_price = center - step * self.tick_size
             cum_ask += asks.get(ask_price, 0.0)
             cum_bid += bids.get(bid_price, 0.0)
-            values[self.window + step] = self._encode_signed_size(cum_ask)
-            values[self.window - step] = self._encode_signed_size(-cum_bid)
+            values[self.window + step] = cum_ask
+            values[self.window - step] = -cum_bid
         return values
 
     def _raw_top5(
@@ -324,9 +324,3 @@ class RepresentationTransform(BaseLOBTransform):
                 values.append(0.0)
 
         return values
-
-    def _encode_signed_size(self, signed_size: float) -> float:
-        """Keep sign and return absolute size magnitude."""
-        sign = 1.0 if signed_size >= 0 else -1.0
-        val = abs(signed_size)
-        return sign * val

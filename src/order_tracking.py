@@ -596,14 +596,7 @@ class VirtualOrder(TrackedOrder):
 
         # Adjust volume ahead in response to cancels/fills/modifies
         if mbo.order_id in self.ids_ahead:
-            if mbo.action == "C":
-                loss = min(mbo.size, self.ids_ahead[mbo.order_id])
-                self.current_vahead -= loss
-                self.ids_ahead[mbo.order_id] -= loss
-                if self.ids_ahead[mbo.order_id] <= 0:
-                    del self.ids_ahead[mbo.order_id]
-
-            elif mbo.action == "F":
+            if mbo.action in ("C", "F"):
                 loss = min(mbo.size, self.ids_ahead[mbo.order_id])
                 self.current_vahead -= loss
                 self.ids_ahead[mbo.order_id] -= loss

@@ -12,7 +12,7 @@ from typing import Tuple
 
 @dataclass(frozen=True)
 class DataConfig:
-    price_unit: int = 1e9  # DataBento prices are in 'nanodollars'.
+    price_unit: float = 1e9  # DataBento prices are in 'nanodollars'.
     t_max_s: float = 10.0
     tox_horizon_s: float = 1.0
 
@@ -20,7 +20,7 @@ class DataConfig:
 @dataclass(frozen=True)
 class FeatureConfig:
     window: int = 20
-    tick_size: int = 0.01 * DataConfig.price_unit
+    tick_size: float = 0.01 * DataConfig.price_unit
     representation: str = "market_depth"  # "moving_window" or "market_depth"
     interval_s: float = 0.1
 
