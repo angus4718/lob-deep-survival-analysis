@@ -8,4 +8,5 @@ artifacts/
 logs/
 wandb/
 results/
+reports/
 *.output.*
