@@ -76,6 +76,12 @@ class BacktestReport:
             if "implementation_shortfall_raw" in raw
             else np.nan,
         }
+        if "decision_model_latency_ns" in raw:
+            latencies_ns = raw["decision_model_latency_ns"].astype(float)
+            latencies_ns = latencies_ns[np.isfinite(latencies_ns)]
+            summary["average_latency_ms"] = (
+                float(latencies_ns.mean() / 1_000_000.0) if len(latencies_ns) else np.nan
+            )
         if "missing_reason" in raw:
             for reason, group in raw.loc[~metric_ok].groupby("missing_reason", dropna=False):
                 summary[f"failed_{reason}_count"] = int(len(group))

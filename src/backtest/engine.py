@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from .metrics import ImplementationShortfallMetric
+from .progress import log, maybe_tqdm
 from .reports import BacktestReport
 from .strategies.base import BaseStrategy
 from .types import BacktestResult, DecisionAction, MarketSnapshot, TradingDecision
@@ -24,6 +25,8 @@ class BacktestEngine:
         lifecycle_aware: bool = False,
         lifecycle_stride: int = 1,
         lifecycle_max_evaluations: int | None = None,
+        verbose: bool = False,
+        progress: bool | None = None,
     ) -> None:
         if int(lifecycle_stride) < 1:
             raise ValueError("lifecycle_stride must be >= 1")
@@ -38,13 +41,29 @@ class BacktestEngine:
             if lifecycle_max_evaluations is not None
             else None
         )
+        self.verbose = bool(verbose)
+        self.progress = self.verbose if progress is None else bool(progress)
 
     def run(self, snapshots: Iterable[MarketSnapshot]) -> BacktestReport:
+        log(
+            self.verbose,
+            "Starting snapshot backtest "
+            f"(lifecycle_aware={self.lifecycle_aware}, stride={self.lifecycle_stride}).",
+        )
         calibration_rows = self._load_calibration_rows(snapshots)
+        if calibration_rows is not None:
+            log(self.verbose, f"Loaded {len(calibration_rows):,} calibration rows for metrics.")
         pending: list[tuple[MarketSnapshot, Any]] = []
         rows: list[dict[str, Any]] = []
         lifecycle_provider = getattr(snapshots, "lifecycle_snapshots", None)
-        for snapshot in snapshots:
+        progress_iter = maybe_tqdm(
+            snapshots,
+            enabled=self.progress,
+            desc="Backtest orders",
+            unit="order",
+            mininterval=1.0,
+        )
+        for snapshot in progress_iter:
             decision = self.strategy.decide(snapshot)
             if self.lifecycle_aware:
                 decision = self._run_lifecycle(
@@ -63,11 +82,20 @@ class BacktestEngine:
             rows.append(snapshot.row.to_dict())
 
         replay_rows = pd.DataFrame(rows)
+        log(self.verbose, f"Evaluated strategy decisions for {len(pending):,} orders.")
+        log(self.verbose, "Preparing metrics.")
         metrics = self._prepare_metrics(
             calibration_rows if calibration_rows is not None else replay_rows
         )
         results: list[BacktestResult] = []
-        for snapshot, decision in pending:
+        result_iter = maybe_tqdm(
+            pending,
+            enabled=self.progress and len(pending) > 0,
+            desc="Backtest metrics",
+            unit="order",
+            mininterval=1.0,
+        )
+        for snapshot, decision in result_iter:
             metric_values = {}
             for metric in metrics:
                 metric_values.update(metric.evaluate(snapshot.row, decision))
@@ -80,6 +108,7 @@ class BacktestEngine:
                     diagnostics=decision.diagnostics,
                 )
             )
+        log(self.verbose, f"Finished snapshot backtest with {len(results):,} results.")
         return BacktestReport(results)
 
     def _run_lifecycle(

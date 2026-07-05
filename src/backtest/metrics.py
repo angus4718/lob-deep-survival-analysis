@@ -74,6 +74,8 @@ class ImplementationShortfallMetric:
         effective_filled = bool(submitted and actual_is_filled and not canceled)
 
         if effective_filled:
+            fill_price = _coalesce_float(row.get("fill_price"), limit_price, row.get("price"))
+            limit_price = fill_price
             if limit_price is None:
                 return self._failed(
                     reason="missing_limit_price",
@@ -126,6 +128,8 @@ class ImplementationShortfallMetric:
                 row.get(self.unfilled_lob_sequence_col),
                 end_idx=_safe_int(decision.diagnostics.get("reference_end_idx")),
             )
+            later_bid = _coalesce_float(row.get("opportunity_reference_bid"), later_bid)
+            later_ask = _coalesce_float(row.get("opportunity_reference_ask"), later_ask)
             reference_source = self.unfilled_lob_sequence_col
             cost_type = "opportunity_cost"
             opportunity = _same_side_opportunity_cost(

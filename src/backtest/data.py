@@ -93,32 +93,17 @@ class BacktestFeatureBuilder:
         selected_end_idx = self._select_end_idx(seq_len) if end_idx is None else int(end_idx)
         selected_end_idx = int(np.clip(selected_end_idx, 0, seq_len - 1))
 
-        lob_win, valid_len = window_with_left_padding(
-            lob_seq,
+        return build_dynamic_feature_window(
+            lob_seq=lob_seq,
+            tox_seq=tox_seq,
+            side=row.get("side"),
             end_idx=selected_end_idx,
             lookback_steps=self.lookback_steps,
-            feat_dim=self.lob_dim,
+            lob_dim=self.lob_dim,
+            tox_dim=self.tox_dim,
+            feat_mean=self.feat_mean,
+            feat_std=self.feat_std,
         )
-        tox_win, _ = window_with_left_padding(
-            tox_seq,
-            end_idx=selected_end_idx,
-            lookback_steps=self.lookback_steps,
-            feat_dim=self.tox_dim,
-        )
-
-        x = np.zeros((self.lookback_steps, self.feature_dim), dtype=np.float32)
-        x[:, : self.lob_dim] = lob_win
-        x[:, self.lob_dim : self.lob_dim + self.tox_dim] = tox_win
-
-        mask = np.zeros(self.lookback_steps, dtype=np.float32)
-        if valid_len > 0:
-            mask[-valid_len:] = 1.0
-        x[:, -2] = side_to_float(row.get("side")) * mask
-        x[:, -1] = mask
-
-        if self.feat_mean is not None and self.feat_std is not None:
-            x = apply_dynamic_normalizer(x[None, :, :], self.feat_mean, self.feat_std)[0]
-        return x.astype(np.float32, copy=False)
 
     def _clip_sequence_len(self, observed_len: int, raw_seq_len) -> int:
         try:
@@ -371,6 +356,61 @@ def window_with_left_padding(
     if valid_len > 0:
         out[-valid_len:, :] = chunk
     return out, valid_len
+
+
+def build_dynamic_feature_window(
+    *,
+    lob_seq: np.ndarray,
+    tox_seq: np.ndarray,
+    side,
+    end_idx: int,
+    lookback_steps: int,
+    lob_dim: int,
+    tox_dim: int,
+    feat_mean: np.ndarray | None = None,
+    feat_std: np.ndarray | None = None,
+) -> np.ndarray:
+    """Build one model-ready dynamic feature window from raw LOB/tox sequences."""
+    lob_arr = np.asarray(lob_seq, dtype=np.float32)
+    tox_arr = np.asarray(tox_seq, dtype=np.float32)
+    if lob_arr.ndim != 2 or lob_arr.shape[1] != int(lob_dim):
+        raise ValueError(f"Unexpected LOB shape {lob_arr.shape}; expected (*, {lob_dim})")
+    if tox_arr.ndim != 2 or tox_arr.shape[1] != int(tox_dim):
+        raise ValueError(
+            f"Unexpected toxicity shape {tox_arr.shape}; expected (*, {tox_dim})"
+        )
+    seq_len = min(lob_arr.shape[0], tox_arr.shape[0])
+    if seq_len <= 0:
+        raise ValueError("Cannot build a dynamic feature window from empty sequences")
+
+    selected_end_idx = int(np.clip(int(end_idx), 0, seq_len - 1))
+    lob_win, valid_len = window_with_left_padding(
+        lob_arr[:seq_len],
+        end_idx=selected_end_idx,
+        lookback_steps=int(lookback_steps),
+        feat_dim=int(lob_dim),
+    )
+    tox_win, _ = window_with_left_padding(
+        tox_arr[:seq_len],
+        end_idx=selected_end_idx,
+        lookback_steps=int(lookback_steps),
+        feat_dim=int(tox_dim),
+    )
+
+    feature_dim = int(lob_dim) + int(tox_dim) + 2
+    x = np.zeros((int(lookback_steps), feature_dim), dtype=np.float32)
+    x[:, : int(lob_dim)] = lob_win
+    x[:, int(lob_dim) : int(lob_dim) + int(tox_dim)] = tox_win
+
+    mask = np.zeros(int(lookback_steps), dtype=np.float32)
+    if valid_len > 0:
+        mask[-valid_len:] = 1.0
+    x[:, -2] = side_to_float(side) * mask
+    x[:, -1] = mask
+
+    if feat_mean is not None and feat_std is not None:
+        x = apply_dynamic_normalizer(x[None, :, :], feat_mean, feat_std)[0]
+    return x.astype(np.float32, copy=False)
 
 
 def apply_dynamic_normalizer(
