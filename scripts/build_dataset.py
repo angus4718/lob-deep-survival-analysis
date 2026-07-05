@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import sys
 import multiprocessing
@@ -38,6 +37,7 @@ from src.order_tracking import (
     analyze_empty_market_splits,
 )
 from src.config import CONFIG
+from src.raw_splits import load_or_build_split_cache
 
 SYMBOL = "AAPL"
 START_DATE = "2026-01-05"
@@ -93,36 +93,12 @@ split_cache_path = Path("/ocean/projects/cis260122p/shared/data/datasets") / f"{
 
 
 def _load_or_build_split_cache(cache_path: Path, dbn_file: Path) -> dict:
-    """Load cached split metadata or build it on first run."""
-    if cache_path.exists():
-        with open(cache_path) as f:
-            cached = json.load(f)
-
-        if isinstance(cached, dict) and {
-            "split_points",
-            "messages_between_splits",
-            "total_messages",
-        }.issubset(cached.keys()):
-            print(
-                "[cache] Loaded split metadata: "
-                f"{len(cached['split_points'])} split points, "
-                f"{cached['total_messages']:,} total messages"
-            )
-            return cached
-
-        print("[cache] Cache format not recognized. Rebuilding split metadata...")
-
-    print(f"[cache] No valid cache found - scanning {dbn_file} for split metadata...")
-    analyzed = analyze_empty_market_splits(file_path=str(dbn_file), verbose=True)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(cache_path, "w") as f:
-        json.dump(analyzed, f)
-    print(
-        "[cache] Saved split metadata: "
-        f"{len(analyzed['split_points'])} split points, "
-        f"{analyzed['total_messages']:,} total messages"
+    """Compatibility wrapper for split-cache tests and older scripts."""
+    return load_or_build_split_cache(
+        cache_path,
+        dbn_file,
+        analyzer=analyze_empty_market_splits,
     )
-    return analyzed
 
 
 def main() -> None:
