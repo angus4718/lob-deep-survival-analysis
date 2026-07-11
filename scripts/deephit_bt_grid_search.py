@@ -163,9 +163,15 @@ def main() -> None:
         cache.save(args.cache_path)
 
     results = pd.DataFrame(rows)
+    is_col = (
+        "mean_is_bps"
+        if "mean_is_bps" in results.columns
+        else "mean_implementation_shortfall_bps"
+    )
+    skipped_col = "skipped" if "skipped" in results.columns else "skipped_orders"
     sort_cols = [
         col
-        for col in ["mean_implementation_shortfall_bps", "skipped_orders"]
+        for col in [is_col, skipped_col]
         if col in results.columns
     ]
     if sort_cols:
@@ -184,7 +190,7 @@ def main() -> None:
             f"max_toxic_probability={best['max_toxic_probability']}, "
             f"min_fill_probability={best['min_fill_probability']}, "
             f"horizon_index={best['horizon_index']}, "
-            f"mean_implementation_shortfall_bps={best.get('mean_implementation_shortfall_bps')}"
+            f"{is_col}={best.get(is_col)}"
         )
 
 
