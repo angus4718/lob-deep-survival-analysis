@@ -192,6 +192,19 @@ class RawDatabentoBacktestEngine:
                     first_order_ts=int(scheduled[0][0]),
                 )
 
+            if last_book is not None and pending:
+                self._apply_due_initial_decisions(
+                    active,
+                    post_trade,
+                    completed,
+                    pending,
+                    last_book,
+                    ts_event,
+                )
+                self._apply_due_cancels(active, completed, pending, last_book, ts_event)
+            if last_book is not None and active:
+                self._censor_due_orders(active, completed, last_book, ts_event)
+
             try:
                 self.market.apply(mbo)
             except (KeyError, AssertionError, ValueError):
@@ -662,6 +675,8 @@ class RawDatabentoBacktestEngine:
                 observation_time=int(ts_event),
                 decision_effective_time=effective_time,
                 lifecycle_evaluations=0,
+                update_idx=0,
+                end_idx=end_idx,
             )
             order.decision = decision
             order.model_latency_ns = int(latency_result.latency_ns)
@@ -823,11 +838,11 @@ class RawDatabentoBacktestEngine:
             pd.Timestamp("2025-12-24").date(),
         )
         if is_early_close:
-            day_end_dt = local_midnight
+            day_end_dt = local_midnight + pd.Timedelta(hours=13)
         else:
             day_end_dt = local_midnight + pd.Timedelta(hours=16)
         day_end_ns = int(day_end_dt.tz_convert("UTC").value)
-        if not is_early_close and day_end_ns <= int(ts_event):
+        if day_end_ns <= int(ts_event):
             day_end_dt = day_end_dt + pd.Timedelta(days=1)
             day_end_ns = int(day_end_dt.tz_convert("UTC").value)
         return day_end_ns
@@ -915,6 +930,8 @@ class RawDatabentoBacktestEngine:
                 observation_time=int(ts_event),
                 decision_effective_time=int(ts_event) + int(latency_result.latency_ns),
                 lifecycle_evaluations=order.lifecycle_evaluations,
+                update_idx=int(snapshot.update_idx),
+                end_idx=snapshot.end_idx,
                 initial_action=DecisionAction.SUBMIT.value,
             )
             if decision.should_cancel:
@@ -971,16 +988,16 @@ class RawDatabentoBacktestEngine:
             if action == DecisionAction.SKIP:
                 self._stats["skipped_orders"] += 1
                 order.decision = item.decision
-                order.skip(book, ts_event)
+                order.skip(book, item.effective_time)
                 completed.append(order)
             elif action == DecisionAction.SUBMIT:
                 order.decision = item.decision
-                if ts_event >= order.deadline_time:
+                if item.effective_time >= order.deadline_time:
                     self._stats["censored_orders"] += 1
-                    order.censor(book, ts_event, reason="CENSORED_LATENCY")
+                    order.censor(book, item.effective_time, reason="CENSORED_LATENCY")
                     completed.append(order)
                     continue
-                order.submit(book, ts_event)
+                order.submit(book, item.effective_time)
                 self._stats["submitted_orders"] += 1
                 order.last_lifecycle_snapshot_count = len(order.lob_sequence_raw_top5)
                 if order.status == "FILLED":
@@ -991,7 +1008,7 @@ class RawDatabentoBacktestEngine:
             else:
                 self._stats["skipped_orders"] += 1
                 order.decision = item.decision
-                order.skip(book, ts_event)
+                order.skip(book, item.effective_time)
                 completed.append(order)
         pending[:] = keep
 
@@ -1012,7 +1029,7 @@ class RawDatabentoBacktestEngine:
             order = item.order
             if not order.is_active:
                 continue
-            if order.apply_cancel_if_due(book, ts_event):
+            if order.apply_cancel_if_due(book, item.effective_time):
                 self._stats["canceled_orders"] += 1
                 order.decision = item.decision
                 completed.append(order)
@@ -1032,7 +1049,7 @@ class RawDatabentoBacktestEngine:
         for order in active:
             if ts_event >= order.deadline_time:
                 self._stats["censored_orders"] += 1
-                order.censor(book, ts_event)
+                order.censor(book, order.deadline_time)
                 completed.append(order)
             else:
                 remaining.append(order)
@@ -1070,17 +1087,22 @@ class RawDatabentoBacktestEngine:
             if item.kind == "initial" and DecisionAction(item.decision.action) == DecisionAction.SKIP:
                 self._stats["skipped_orders"] += 1
                 order.decision = item.decision
-                order.skip(book, ts_event)
+                skip_time = item.effective_time if item.effective_time <= ts_event else ts_event
+                order.skip(book, skip_time)
             else:
                 self._stats["censored_orders"] += 1
-                order.censor(book, ts_event, reason="CENSORED_END")
+                censor_time = min(int(ts_event), int(order.deadline_time))
+                reason = "CENSORED_TIME" if order.deadline_time <= ts_event else "CENSORED_END"
+                order.censor(book, censor_time, reason=reason)
             completed.append(order)
         pending.clear()
 
         for order in active:
             if not order.is_terminal:
                 self._stats["censored_orders"] += 1
-                order.censor(book, ts_event, reason="CENSORED_END")
+                censor_time = min(int(ts_event), int(order.deadline_time))
+                reason = "CENSORED_TIME" if order.deadline_time <= ts_event else "CENSORED_END"
+                order.censor(book, censor_time, reason=reason)
                 completed.append(order)
         active.clear()
 
@@ -1113,6 +1135,8 @@ class RawDatabentoBacktestEngine:
         observation_time: int,
         decision_effective_time: int,
         lifecycle_evaluations: int,
+        update_idx: int,
+        end_idx: int | None,
         initial_action: str | None = None,
     ) -> TradingDecision:
         diagnostics = dict(decision.diagnostics)
@@ -1124,8 +1148,8 @@ class RawDatabentoBacktestEngine:
                 "decision_effective_time": int(decision_effective_time),
                 "lifecycle_evaluations": int(lifecycle_evaluations),
                 "initial_feature_source": order.initial_feature_source,
-                "update_idx": max(0, len(order.lob_sequence_raw_top5) - 1),
-                "end_idx": max(0, len(order.lob_sequence_raw_top5) - 1),
+                "update_idx": int(update_idx),
+                "end_idx": int(end_idx) if end_idx is not None else None,
             }
         )
         if initial_action is not None:

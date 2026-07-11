@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from enum import Enum
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -18,6 +19,12 @@ from src.backtest import (
 from src.backtest.metrics import ImplementationShortfallMetric
 from src.backtest.strategies.base import BaseStrategy
 from src.backtest.types import DecisionAction, TradingDecision
+
+
+class MboAction(Enum):
+    FILL = "F"
+    CANCEL = "C"
+    MODIFY = "M"
 
 
 class SubmitStrategy(BaseStrategy):
@@ -220,6 +227,109 @@ def test_raw_engine_applies_static_latency_before_submit():
     assert raw.loc[0, "decision_submit_time"] == 110
 
 
+def test_raw_engine_queue_depletion_accepts_enum_action_values():
+    records = [
+        mbo(100),
+        mbo(110),
+        mbo(120, order_id=1, action=MboAction.FILL, size=5),
+    ]
+    report = RawDatabentoBacktestEngine(
+        SubmitStrategy(),
+        records=records,
+        market=DummyMarket(),
+        feature_builder=feature_builder(),
+        metrics=[metric()],
+        latency_provider=StaticLatencyProvider(latency_ns=10),
+        snapshot_bin_messages=1,
+    ).run(labeled_orders())
+
+    raw = report.raw_frame()
+    assert len(raw) == 1
+    assert raw.loc[0, "filled"]
+    assert raw.loc[0, "decision_fill_trigger"] == "queue_depleted"
+    assert raw.loc[0, "decision_fill_mbo_action"] == "F"
+
+
+def test_raw_engine_fills_buy_when_later_ask_crosses_limit():
+    records = [
+        mbo(100, bid_price=99, ask_price=101),
+        mbo(110, bid_price=99, ask_price=101),
+        mbo(120, bid_price=99, ask_price=100),
+        mbo(1_000_200, bid_price=99, ask_price=100),
+    ]
+    report = RawDatabentoBacktestEngine(
+        SubmitStrategy(),
+        records=records,
+        market=DummyMarket(),
+        feature_builder=feature_builder(),
+        metrics=[metric()],
+        latency_provider=StaticLatencyProvider(latency_ns=10),
+        snapshot_bin_messages=1,
+    ).run(labeled_orders(side="B", price=100, duration_s=1.0))
+
+    raw = report.raw_frame()
+    assert len(raw) == 1
+    assert raw.loc[0, "submitted"]
+    assert raw.loc[0, "filled"]
+    assert raw.loc[0, "decision_raw_status"] == "FILLED"
+    assert raw.loc[0, "decision_fill_trigger"] == "marketable_after_submit_no_queue"
+    assert raw.loc[0, "limit_price_raw"] == 100
+
+
+def test_raw_engine_fills_sell_when_later_bid_crosses_limit():
+    records = [
+        mbo(100, bid_price=99, ask_price=101),
+        mbo(110, bid_price=99, ask_price=101),
+        mbo(120, bid_price=100, ask_price=101),
+        mbo(1_000_200, bid_price=100, ask_price=101),
+    ]
+    report = RawDatabentoBacktestEngine(
+        SubmitStrategy(),
+        records=records,
+        market=DummyMarket(),
+        feature_builder=feature_builder(),
+        metrics=[metric()],
+        latency_provider=StaticLatencyProvider(latency_ns=10),
+        snapshot_bin_messages=1,
+    ).run(labeled_orders(side="A", price=100, duration_s=1.0))
+
+    raw = report.raw_frame()
+    assert len(raw) == 1
+    assert raw.loc[0, "submitted"]
+    assert raw.loc[0, "filled"]
+    assert raw.loc[0, "decision_raw_status"] == "FILLED"
+    assert raw.loc[0, "decision_fill_trigger"] == "marketable_after_submit_no_queue"
+    assert raw.loc[0, "limit_price_raw"] == 100
+
+
+def test_raw_engine_does_not_fill_marketable_buy_before_queue_ahead_depletes():
+    records = [
+        mbo(100, bid_price=100, bid_size=5, ask_price=101),
+        mbo(110, bid_price=100, bid_size=5, ask_price=101),
+        mbo(120, bid_price=100, bid_size=5, ask_price=100),
+        mbo(130, order_id=1, action="F", size=5),
+        mbo(1_000_200, bid_price=100, bid_size=0, ask_price=100),
+    ]
+    report = RawDatabentoBacktestEngine(
+        SubmitStrategy(),
+        records=records,
+        market=DummyMarket(),
+        feature_builder=feature_builder(),
+        metrics=[metric()],
+        latency_provider=StaticLatencyProvider(latency_ns=10),
+        snapshot_bin_messages=1,
+    ).run(labeled_orders(side="B", price=100, duration_s=1.0))
+
+    raw = report.raw_frame()
+    assert len(raw) == 1
+    assert raw.loc[0, "submitted"]
+    assert raw.loc[0, "filled"]
+    assert raw.loc[0, "decision_marketable_after_submit_seen"]
+    assert raw.loc[0, "decision_marketable_after_submit_time"] == 120
+    assert raw.loc[0, "decision_end_time"] == 130
+    assert raw.loc[0, "decision_fill_trigger"] == "queue_depleted"
+
+
 def test_raw_report_summary_includes_average_latency_ms():
     records = [
         mbo(100),
@@ -237,6 +347,10 @@ def test_raw_report_summary_includes_average_latency_ms():
 
     summary = report.summary_frame()
     assert summary.loc[0, "average_latency_ms"] == 0.5
+    assert summary.loc[0, "time_weight_min_horizon_ms"] == 0.001
+    assert summary.loc[0, "time_weight_sum"] == 1.0
+    assert "time_weighted_mean_is_bps" in summary.columns
+    assert "opportunity_cost_time_weighted_mean_bps" in summary.columns
 
 
 def test_raw_engine_skip_uses_same_side_quote_after_latency():
@@ -259,7 +373,30 @@ def test_raw_engine_skip_uses_same_side_quote_after_latency():
     assert not raw.loc[0, "submitted"]
     assert raw.loc[0, "cost_type"] == "opportunity_cost"
     assert raw.loc[0, "opportunity_quote_side"] == "ask"
-    assert raw.loc[0, "implementation_shortfall_raw"] == 4.0
+    assert raw.loc[0, "decision_end_time"] == 120
+    assert raw.loc[0, "implementation_shortfall_raw"] == 0.0
+
+
+def test_raw_engine_skip_end_time_does_not_wait_for_next_message_gap():
+    records = [
+        mbo(100, bid_price=100, ask_price=101),
+        mbo(1_000_000, bid_price=100, ask_price=105),
+    ]
+    report = RawDatabentoBacktestEngine(
+        SkipStrategy(),
+        records=records,
+        market=DummyMarket(),
+        feature_builder=feature_builder(),
+        metrics=[metric()],
+        latency_provider=StaticLatencyProvider(latency_ns=20),
+        snapshot_bin_messages=1,
+    ).run(labeled_orders())
+
+    raw = report.raw_frame()
+    assert len(raw) == 1
+    assert not raw.loc[0, "submitted"]
+    assert raw.loc[0, "decision_decision_effective_time"] == 120
+    assert raw.loc[0, "decision_end_time"] == 120
 
 
 def test_raw_engine_lifecycle_cancel_uses_cancel_latency():
@@ -285,7 +422,7 @@ def test_raw_engine_lifecycle_cancel_uses_cancel_latency():
     assert len(raw) == 1
     assert raw.loc[0, "decision_action"] == "cancel"
     assert raw.loc[0, "canceled"]
-    assert raw.loc[0, "decision_end_time"] == 120
+    assert raw.loc[0, "decision_end_time"] == 115
 
 
 def test_raw_engine_rejects_orders_before_raw_start_by_default():
@@ -415,6 +552,7 @@ def test_raw_engine_default_deadline_is_regular_session_end():
     assert len(raw) == 1
     assert raw.loc[0, "decision_raw_status"] == "CENSORED_TIME"
     assert raw.loc[0, "decision_deadline_time"] == day_end_time
+    assert raw.loc[0, "decision_end_time"] == day_end_time
 
 
 def test_raw_engine_labeled_duration_deadline_starts_at_observation_time():
@@ -440,3 +578,39 @@ def test_raw_engine_labeled_duration_deadline_starts_at_observation_time():
     assert raw.loc[0, "decision_raw_status"] == "CENSORED_TIME"
     assert raw.loc[0, "decision_has_deadline"]
     assert raw.loc[0, "decision_deadline_time"] == 210
+    assert raw.loc[0, "decision_end_time"] == 210
+
+
+def test_raw_engine_early_close_deadline_is_1pm_et():
+    observation_time = int(
+        pd.Timestamp("2025-11-28 12:59:59.999999990", tz="America/New_York")
+        .tz_convert("UTC")
+        .value
+    )
+    early_close_time = int(
+        pd.Timestamp("2025-11-28 13:00:00", tz="America/New_York")
+        .tz_convert("UTC")
+        .value
+    )
+    records = [
+        mbo(observation_time),
+        mbo(early_close_time + 1),
+    ]
+    rows = labeled_orders(duration_s=999.0)
+    rows.loc[0, "entry_time"] = observation_time
+
+    report = RawDatabentoBacktestEngine(
+        SubmitStrategy(),
+        records=records,
+        market=DummyMarket(),
+        feature_builder=feature_builder(),
+        metrics=[metric()],
+        latency_provider=StaticLatencyProvider(latency_ns=0),
+        snapshot_bin_messages=1,
+    ).run(rows)
+
+    raw = report.raw_frame()
+    assert len(raw) == 1
+    assert raw.loc[0, "decision_raw_status"] == "CENSORED_TIME"
+    assert raw.loc[0, "decision_deadline_time"] == early_close_time
+    assert raw.loc[0, "decision_end_time"] == early_close_time

@@ -154,7 +154,18 @@ class RawBacktestOrder:
         """Update queue state from one raw message."""
         if not self.is_active:
             return
-        self._record_marketable_after_submit(book, int(mbo.ts_event))
+        marketable_fill_price = self._marketable_fill_price(book)
+        if marketable_fill_price is not None:
+            self._record_marketable_after_submit(book, int(mbo.ts_event))
+            if not self.tracking_queue or self.current_vahead <= 0:
+                self._fill(
+                    book,
+                    int(mbo.ts_event),
+                    fill_price=self.limit_price,
+                    trigger="marketable_after_submit_no_queue",
+                    mbo=mbo,
+                )
+                return
         if self.tracking_queue and self.current_vahead <= 0:
             self._fill(
                 book,
@@ -166,7 +177,7 @@ class RawBacktestOrder:
             return
 
         order_id = getattr(mbo, "order_id", None)
-        action = getattr(mbo, "action", None)
+        action = _action_value(getattr(mbo, "action", None))
         size = int(getattr(mbo, "size", 0) or 0)
         if self.tracking_queue and order_id in self.ids_ahead:
             old_size = int(self.ids_ahead[order_id])
@@ -282,12 +293,7 @@ class RawBacktestOrder:
         self.fill_price = int(fill_price)
         self.fill_trigger = trigger
         if mbo is not None:
-            mbo_action = getattr(mbo, "action", None)
-            self.fill_mbo_action = (
-                getattr(mbo_action, "value", None)
-                if getattr(mbo_action, "value", None) is not None
-                else str(mbo_action) if mbo_action is not None else None
-            )
+            self.fill_mbo_action = _action_value(getattr(mbo, "action", None))
             mbo_order_id = getattr(mbo, "order_id", None)
             self.fill_mbo_order_id = int(mbo_order_id) if mbo_order_id is not None else None
         self.status = "FILLED"
@@ -334,12 +340,19 @@ class RawBacktestOrder:
         return True, int(size)
 
     def _is_marketable(self, book: Any) -> bool:
+        return self._marketable_fill_price(book) is not None
+
+    def _marketable_fill_price(self, book: Any) -> int | None:
         bid, ask = best_bid_ask(book)
         if self.side == "B":
-            return bool(ask is not None and int(self.limit_price) >= int(ask.price))
+            if ask is not None and int(self.limit_price) >= int(ask.price):
+                return int(ask.price)
+            return None
         if self.side == "A":
-            return bool(bid is not None and int(self.limit_price) <= int(bid.price))
-        return False
+            if bid is not None and int(self.limit_price) <= int(bid.price):
+                return int(bid.price)
+            return None
+        return None
 
     def _record_marketable_after_submit(self, book: Any, ts_event: int) -> None:
         if self.marketable_after_submit_seen or not self._is_marketable(book):
@@ -371,6 +384,15 @@ def _raw_top5_from_snapshot(snapshot) -> list[float] | None:
         else:
             values.extend([0.0, 0.0])
     return values
+
+
+def _action_value(action: Any) -> str | None:
+    if action is None:
+        return None
+    value = getattr(action, "value", None)
+    if value is not None:
+        return str(value)
+    return str(action)
 
 
 def coerce_price(value: Any) -> int | None:

@@ -152,8 +152,8 @@ def _selected_chunk_message_totals(
     running = 0
     total_before_point: dict[int, int] = {}
     for split_point, seg_count in zip(empty_points, messages_between_splits[:-1]):
-        total_before_point[int(split_point)] = running
         running += int(seg_count)
+        total_before_point[int(split_point)] = running
 
     resolved_total = (
         int(total_messages)
