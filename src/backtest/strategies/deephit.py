@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 import pickle
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import torch
 
 from src.backtest.strategies.base import BaseStrategy, DecisionLogic
@@ -108,7 +110,7 @@ def build_dynamic_deephit_model(
     if name == "gru":
         defaults = {
             "hidden_size": 160,
-            "num_layers": 1,
+            "num_layers": 2,
             "rnn_dropout": 0.2,
             "fc_hidden": int(160 * 1.75),
             "fc_dropout": 0.2,
@@ -133,9 +135,9 @@ def build_dynamic_deephit_model(
     if name == "transformer":
         defaults = {
             "hidden_size": 96,
-            "num_layers": 4,
+            "num_layers": 2,
             "num_heads": 4,
-            "transformer_ff_dim": int(96 * 3.0),
+            "transformer_ff_dim": int(96 * 2.0),
             "transformer_dropout": 0.1,
             "max_seq_len": seq_len,
             "fc_hidden": int(96 * 1.75),
@@ -145,13 +147,13 @@ def build_dynamic_deephit_model(
         return DeepHitTransformerCompeting(num_features, num_events, num_time_steps, **defaults)
     if name == "mamba":
         defaults = {
-            "hidden_size": 96,
-            "num_mamba_layers": 2,
+            "hidden_size": 144,
+            "num_mamba_layers": 1,
             "d_state": 8,
             "d_conv": 4,
-            "expand": 4,
+            "expand": 2,
             "mamba_dropout": 0.15,
-            "fc_hidden": int(96 * 1.75),
+            "fc_hidden": int(144 * 1.75),
             "fc_dropout": 0.2,
         }
         defaults.update(kwargs)
@@ -177,7 +179,8 @@ class DeepHitThresholdDecisionLogic(DecisionLogic):
 
     def decide(self, prediction: dict[str, Any], snapshot: MarketSnapshot) -> TradingDecision:
         cif = np.asarray(prediction["cif"], dtype=np.float32)
-        horizon = int(self.horizon_index)
+        requested_horizon = int(self.horizon_index)
+        horizon = _bounded_horizon_index(requested_horizon, cif.shape[1])
         toxic_cif = float(cif[1, horizon])
         favorable_cif = float(cif[0, horizon])
         fill_cif = float(toxic_cif + favorable_cif)
@@ -236,6 +239,66 @@ class DeepHitThresholdDecisionLogic(DecisionLogic):
         )
 
 
+@dataclass(frozen=True)
+class DeepHitToxicCIFDecisionLogic(DecisionLogic):
+    """One-threshold rule using the toxic cumulative incidence directly.
+
+    This keeps the DeepHit survival output in its native form: submit or hold
+    when the model's cumulative toxic-event probability by the selected horizon
+    is below the configured threshold.
+    """
+
+    max_toxic_cif: float = 0.2
+    horizon_index: int = -1
+    eps: float = 1e-8
+
+    def decide(self, prediction: dict[str, Any], snapshot: MarketSnapshot) -> TradingDecision:
+        cif = np.asarray(prediction["cif"], dtype=np.float32)
+        requested_horizon = int(self.horizon_index)
+        horizon = _bounded_horizon_index(requested_horizon, cif.shape[1])
+        toxic_cif = float(cif[1, horizon])
+        favorable_cif = float(cif[0, horizon])
+        fill_cif = float(toxic_cif + favorable_cif)
+        survival_prob = float(max(0.0, 1.0 - fill_cif))
+        toxic_probability = (
+            float(toxic_cif / max(fill_cif, float(self.eps)))
+            if fill_cif > float(self.eps)
+            else 0.0
+        )
+
+        pass_threshold = toxic_cif <= float(self.max_toxic_cif)
+        if snapshot.position_open:
+            action = DecisionAction.HOLD if pass_threshold else DecisionAction.CANCEL
+            reason = "toxic_cif_hold" if pass_threshold else "toxic_cif_cancel"
+        else:
+            action = DecisionAction.SUBMIT if pass_threshold else DecisionAction.SKIP
+            reason = "toxic_cif_pass" if pass_threshold else "toxic_cif_fail"
+
+        return TradingDecision(
+            action=action,
+            limit_price=_as_float(snapshot.row.get("price")),
+            reason=reason,
+            diagnostics={
+                "score_name": "toxic_cif",
+                "score": toxic_cif,
+                "favorable_probability": favorable_cif,
+                "toxic_probability": toxic_probability,
+                "fill_probability": fill_cif,
+                "favorable_cif": favorable_cif,
+                "toxic_cif": toxic_cif,
+                "fill_cif": fill_cif,
+                "survival_probability": survival_prob,
+                "max_toxic_cif": float(self.max_toxic_cif),
+                "horizon_index": horizon,
+                "requested_horizon_index": requested_horizon,
+                "update_idx": int(snapshot.update_idx),
+                "end_idx": int(snapshot.end_idx) if snapshot.end_idx is not None else None,
+                "is_initial": bool(snapshot.is_initial),
+                "position_open": bool(snapshot.position_open),
+            },
+        )
+
+
 class DeepHitStrategy(BaseStrategy):
     """Strategy composed of a trained DeepHit model and custom decision logic."""
 
@@ -247,13 +310,17 @@ class DeepHitStrategy(BaseStrategy):
         device: str | torch.device | None = None,
         prediction_cache: DeepHitPredictionCache | None = None,
         cache_predictions: bool = True,
+        model_name: str | None = None,
+        strict_cache_key: bool = False,
     ) -> None:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model = model.to(self.device)
         self.model.eval()
+        self.model_name = str(model_name or self.model.__class__.__name__)
         self.decision_logic = decision_logic
         self.prediction_cache = prediction_cache
         self.cache_predictions = bool(cache_predictions)
+        self.strict_cache_key = bool(strict_cache_key)
 
     @classmethod
     def from_saved_model(
@@ -270,6 +337,7 @@ class DeepHitStrategy(BaseStrategy):
         device: str | torch.device | None = None,
         prediction_cache: DeepHitPredictionCache | None = None,
         cache_predictions: bool = True,
+        strict_cache_key: bool = False,
     ) -> "DeepHitStrategy":
         model = build_dynamic_deephit_model(
             model_name=model_name,
@@ -288,6 +356,8 @@ class DeepHitStrategy(BaseStrategy):
             device=device,
             prediction_cache=prediction_cache,
             cache_predictions=cache_predictions,
+            model_name=model_name,
+            strict_cache_key=strict_cache_key,
         )
 
     def predict(self, snapshot: MarketSnapshot) -> dict[str, Any]:
@@ -308,14 +378,18 @@ class DeepHitStrategy(BaseStrategy):
         return prediction
 
     def _cache_key(self, snapshot: MarketSnapshot) -> tuple[Any, ...]:
-        return (
+        key = (
             "deephit",
-            snapshot.order_id,
-            int(snapshot.row_index),
+            self.model_name,
+            _cache_scalar(snapshot.order_id),
+            _cache_scalar(snapshot.row.get("entry_time")),
             int(snapshot.end_idx) if snapshot.end_idx is not None else None,
             int(snapshot.update_idx),
             tuple(int(v) for v in snapshot.features.shape),
         )
+        if self.strict_cache_key:
+            key = (*key, _feature_digest(snapshot.features))
+        return key
 
     def decide(self, snapshot: MarketSnapshot) -> TradingDecision:
         prediction = self.predict(snapshot)
@@ -329,3 +403,30 @@ def _as_float(value) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _feature_digest(features: np.ndarray) -> str:
+    arr = np.ascontiguousarray(features)
+    return hashlib.blake2b(arr.view(np.uint8), digest_size=16).hexdigest()
+
+
+def _bounded_horizon_index(horizon_index: int, num_steps: int) -> int:
+    if int(num_steps) <= 0:
+        raise ValueError("DeepHit CIF must contain at least one horizon.")
+    horizon = int(horizon_index)
+    if horizon < 0:
+        return max(-int(num_steps), horizon)
+    return min(horizon, int(num_steps) - 1)
+
+
+def _cache_scalar(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, np.generic):
+        return value.item()
+    return value

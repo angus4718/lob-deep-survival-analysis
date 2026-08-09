@@ -100,6 +100,8 @@ class BacktestReport:
             summary["average_latency_ms"] = (
                 float(latencies_ns.mean() / 1_000_000.0) if len(latencies_ns) else np.nan
             )
+        if "fill_adjusted_toxic_cost_bps" in raw:
+            summary.update(_fill_adjusted_toxic_cost_summary(raw))
         if "missing_reason" in raw:
             for reason, group in raw.loc[~metric_ok].groupby("missing_reason", dropna=False):
                 summary[f"failed_{reason}_count"] = int(len(group))
@@ -207,6 +209,40 @@ def _time_weighted_shortfall(
             "horizon_ms_median": _median(horizons_ms.loc[mask]),
         }
     return out
+
+
+def _fill_adjusted_toxic_cost_summary(raw: pd.DataFrame) -> dict[str, Any]:
+    values = pd.to_numeric(raw["fill_adjusted_toxic_cost_bps"], errors="coerce")
+    finite = values[np.isfinite(values)]
+    positive = finite[finite > 0]
+    negative = finite[finite < 0]
+    summary: dict[str, Any] = {
+        "fill_adjusted_toxic_cost_mean_bps": (
+            float(finite.mean()) if len(finite) else np.nan
+        ),
+        "fill_adjusted_toxic_cost_median_bps": (
+            float(finite.median()) if len(finite) else np.nan
+        ),
+        "fill_adjusted_toxic_cost_sum_bps": (
+            float(finite.sum()) if len(finite) else np.nan
+        ),
+        "fill_adjusted_toxic_cost_count": int(len(finite)),
+        "fill_adjusted_toxic_cost_missing_count": int(values.isna().sum()),
+        "fill_adjusted_toxic_cost_positive_count": int(len(positive)),
+        "fill_adjusted_toxic_cost_negative_count": int(len(negative)),
+        "fill_adjusted_toxic_cost_zero_count": int((finite == 0).sum()),
+    }
+    if "fill_adjusted_toxic_cost_status" in raw:
+        for status, group in raw.groupby("fill_adjusted_toxic_cost_status", dropna=False):
+            summary[f"fill_adjusted_toxic_cost_status_{status}_count"] = int(len(group))
+    if "fill_adjusted_toxic_cost_component" in raw:
+        for component, group in raw.groupby("fill_adjusted_toxic_cost_component", dropna=False):
+            summary[f"fill_adjusted_toxic_cost_component_{component}_count"] = int(len(group))
+    if "fill_adjusted_toxic_cost_missing_reason" in raw:
+        missing = raw[raw["fill_adjusted_toxic_cost_bps"].isna()]
+        for reason, group in missing.groupby("fill_adjusted_toxic_cost_missing_reason", dropna=False):
+            summary[f"fill_adjusted_toxic_cost_missing_{reason}_count"] = int(len(group))
+    return summary
 
 
 def _measurement_horizon_ms(df: pd.DataFrame) -> pd.Series:

@@ -246,12 +246,20 @@ class RawBacktestOrder:
 
     def to_metric_row(self) -> pd.Series:
         out = dict(self.row.to_dict())
+        labeled_status_reason = out.get("status_reason")
+        labeled_event_type = out.get("event_type")
+        labeled_event = out.get("event")
+        labeled_fill_price = out.get("fill_price")
         end_time = int(self.end_time or self.observation_time)
         duration_s = max(0.0, (end_time - int(self.observation_time)) / 1e9)
         is_filled = self.status == "FILLED"
 
         out.update(
             {
+                "labeled_status_reason": labeled_status_reason,
+                "labeled_event_type": labeled_event_type,
+                "labeled_event": labeled_event,
+                "labeled_fill_price": labeled_fill_price,
                 "order_id": self.order_id,
                 "entry_time": int(self.observation_time),
                 "duration_s": duration_s,

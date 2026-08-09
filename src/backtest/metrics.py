@@ -26,6 +26,16 @@ class _OpportunityCostResult:
 
 
 @dataclass(frozen=True)
+class _FillAdjustedToxicCostResult:
+    bps: float | None = None
+    raw_cost: float | None = None
+    reference_mid: float | None = None
+    component: str = "unfilled_zero"
+    status: str = "ok"
+    missing_reason: str | None = None
+
+
+@dataclass(frozen=True)
 class ImplementationShortfallMetric:
     """Compute implementation shortfall from realized labeled-order outcomes."""
 
@@ -69,9 +79,19 @@ class ImplementationShortfallMetric:
             int(EventType.FAVORABLE_FILL),
             int(EventType.TOXIC_FILL),
         }
+        labeled_actual_is_filled = _labeled_actual_is_filled(row, actual_is_filled)
         submitted = action != DecisionAction.SKIP
         canceled = action == DecisionAction.CANCEL
         effective_filled = bool(submitted and actual_is_filled and not canceled)
+        fill_adjusted = _fill_adjusted_toxic_cost(
+            row,
+            side=side,
+            submitted=submitted,
+            canceled=canceled,
+            effective_filled=effective_filled,
+            labeled_actual_is_filled=labeled_actual_is_filled,
+            selected_window_ms=int(self.selected_window_ms),
+        )
 
         if effective_filled:
             fill_price = _coalesce_float(row.get("fill_price"), limit_price, row.get("price"))
@@ -84,6 +104,7 @@ class ImplementationShortfallMetric:
                     actual_filled=bool(actual_is_filled),
                     canceled=canceled,
                     cost_type="toxic_cost",
+                    fill_adjusted=fill_adjusted,
                 )
             bid_col, ask_col = self._selected_post_trade_cols()
             reference_mid = _mid_price(
@@ -102,6 +123,7 @@ class ImplementationShortfallMetric:
                     cost_type=cost_type,
                     reference_source=reference_source,
                     limit_price=limit_price,
+                    fill_adjusted=fill_adjusted,
                 )
 
             signed_cost = _side_cost(side, limit_price, reference_mid)
@@ -116,9 +138,17 @@ class ImplementationShortfallMetric:
                     reference_source=reference_source,
                     limit_price=limit_price,
                     reference_mid=reference_mid,
+                    fill_adjusted=fill_adjusted,
                 )
             basis_price = reference_mid
             reference_price = reference_mid
+            fill_adjusted = _FillAdjustedToxicCostResult(
+                bps=float(signed_cost / basis_price * 10000.0) if basis_price else np.nan,
+                raw_cost=float(signed_cost),
+                reference_mid=reference_mid,
+                component="realized_toxic_cost",
+                status="ok",
+            )
             extra_fields: dict[str, Any] = {
                 "reference_mid": _price_to_dollars(reference_mid, self.price_unit),
                 "reference_mid_raw": reference_mid,
@@ -149,6 +179,7 @@ class ImplementationShortfallMetric:
                     cost_type=cost_type,
                     reference_source=reference_source,
                     limit_price=limit_price,
+                    fill_adjusted=fill_adjusted,
                 )
             signed_cost = float(opportunity.cost)
             basis_price = float(opportunity.entry_quote)
@@ -192,11 +223,11 @@ class ImplementationShortfallMetric:
             "implementation_shortfall_bps": float(cost_bps),
         }
         out.update(extra_fields)
+        out.update(_fill_adjusted_fields(fill_adjusted, self.price_unit))
         return out
 
     def _selected_post_trade_cols(self) -> tuple[str, str]:
-        suffix = ms_to_suffix(int(self.selected_window_ms))
-        return f"post_trade_best_bid_{suffix}", f"post_trade_best_ask_{suffix}"
+        return _post_trade_cols(int(self.selected_window_ms))
 
     def _failed(
         self,
@@ -210,6 +241,7 @@ class ImplementationShortfallMetric:
         reference_source: str | None = None,
         limit_price: float | None = None,
         reference_mid: float | None = None,
+        fill_adjusted: "_FillAdjustedToxicCostResult | None" = None,
     ) -> dict[str, Any]:
         out = {
             "metric_status": "failed",
@@ -236,6 +268,8 @@ class ImplementationShortfallMetric:
         if reference_mid is not None:
             out["reference_mid"] = _price_to_dollars(reference_mid, self.price_unit)
             out["reference_mid_raw"] = reference_mid
+        if fill_adjusted is not None:
+            out.update(_fill_adjusted_fields(fill_adjusted, self.price_unit))
         return out
 
 
@@ -285,11 +319,164 @@ def _available_post_trade_windows(df: pd.DataFrame) -> list[int]:
 
 
 def _side_cost(side: str, limit_price: float, reference_mid: float) -> float:
-    if side == "B":
+    side = str(side).upper()
+    if side in {"B", "BUY", "BID"}:
         return float(limit_price - reference_mid)
-    if side == "A":
+    if side in {"A", "ASK", "SELL", "S"}:
         return float(reference_mid - limit_price)
     return float("nan")
+
+
+def _fill_adjusted_toxic_cost(
+    row: pd.Series,
+    *,
+    side: str,
+    submitted: bool,
+    canceled: bool,
+    effective_filled: bool,
+    labeled_actual_is_filled: bool,
+    selected_window_ms: int,
+) -> _FillAdjustedToxicCostResult:
+    if effective_filled:
+        return _FillAdjustedToxicCostResult(
+            bps=np.nan,
+            raw_cost=np.nan,
+            component="realized_toxic_cost",
+            status="pending_realized_toxic_cost",
+        )
+    if (not submitted or canceled) and labeled_actual_is_filled:
+        theoretical = _theoretical_toxic_cost(
+            row,
+            side=side,
+            selected_window_ms=selected_window_ms,
+        )
+        if theoretical.status != "ok" or theoretical.bps is None:
+            return _FillAdjustedToxicCostResult(
+                bps=np.nan,
+                raw_cost=np.nan,
+                reference_mid=theoretical.reference_mid,
+                component="flipped_counterfactual_toxic_cost",
+                status="failed",
+                missing_reason=theoretical.missing_reason or "missing_counterfactual_toxic_cost",
+            )
+        return _FillAdjustedToxicCostResult(
+            bps=-float(theoretical.bps),
+            raw_cost=-float(theoretical.raw_cost) if theoretical.raw_cost is not None else np.nan,
+            reference_mid=theoretical.reference_mid,
+            component="flipped_counterfactual_toxic_cost",
+            status="ok",
+        )
+    return _FillAdjustedToxicCostResult(
+        bps=0.0,
+        raw_cost=0.0,
+        component="unfilled_zero",
+        status="ok",
+    )
+
+
+def _theoretical_toxic_cost(
+    row: pd.Series,
+    *,
+    side: str,
+    selected_window_ms: int,
+) -> _FillAdjustedToxicCostResult:
+    fill_price = _coalesce_float(
+        row.get("labeled_fill_price"),
+        row.get("original_fill_price"),
+        row.get("fill_price"),
+        row.get("price"),
+    )
+    if fill_price is None:
+        return _FillAdjustedToxicCostResult(
+            component="counterfactual_toxic_cost",
+            status="failed",
+            missing_reason="missing_counterfactual_fill_price",
+        )
+    bid_col, ask_col = _post_trade_cols(selected_window_ms)
+    reference_mid = _mid_price(row.get(bid_col), row.get(ask_col))
+    if reference_mid is None:
+        return _FillAdjustedToxicCostResult(
+            component="counterfactual_toxic_cost",
+            status="failed",
+            missing_reason="missing_counterfactual_reference_mid",
+        )
+    signed_cost = _side_cost(side, fill_price, reference_mid)
+    if not np.isfinite(signed_cost):
+        return _FillAdjustedToxicCostResult(
+            raw_cost=signed_cost,
+            reference_mid=reference_mid,
+            component="counterfactual_toxic_cost",
+            status="failed",
+            missing_reason="invalid_counterfactual_side",
+        )
+    bps = signed_cost / reference_mid * 10000.0 if reference_mid else np.nan
+    return _FillAdjustedToxicCostResult(
+        bps=float(bps),
+        raw_cost=float(signed_cost),
+        reference_mid=reference_mid,
+        component="counterfactual_toxic_cost",
+        status="ok",
+    )
+
+
+def _fill_adjusted_fields(
+    result: _FillAdjustedToxicCostResult,
+    price_unit: float,
+) -> dict[str, Any]:
+    raw_cost = (
+        float(result.raw_cost)
+        if result.raw_cost is not None and np.isfinite(float(result.raw_cost))
+        else np.nan
+    )
+    reference_mid = (
+        float(result.reference_mid)
+        if result.reference_mid is not None and np.isfinite(float(result.reference_mid))
+        else np.nan
+    )
+    out: dict[str, Any] = {
+        "fill_adjusted_toxic_cost_status": result.status,
+        "fill_adjusted_toxic_cost_component": result.component,
+        "fill_adjusted_toxic_cost_bps": (
+            float(result.bps)
+            if result.bps is not None and np.isfinite(float(result.bps))
+            else np.nan
+        ),
+        "fill_adjusted_toxic_cost_raw": raw_cost,
+        "fill_adjusted_toxic_cost": (
+            _price_to_dollars(raw_cost, price_unit) if np.isfinite(raw_cost) else np.nan
+        ),
+        "fill_adjusted_toxic_cost_reference_mid_raw": reference_mid,
+        "fill_adjusted_toxic_cost_reference_mid": (
+            _price_to_dollars(reference_mid, price_unit)
+            if np.isfinite(reference_mid)
+            else np.nan
+        ),
+    }
+    if result.missing_reason is not None:
+        out["fill_adjusted_toxic_cost_missing_reason"] = result.missing_reason
+    return out
+
+
+def _labeled_actual_is_filled(row: pd.Series, fallback: bool) -> bool:
+    for status_col in ("labeled_status_reason", "original_status_reason"):
+        if status_col in row:
+            status = str(row.get(status_col, "")).upper()
+            if status == "FILLED":
+                return True
+            if status and status not in {"NAN", "NONE"}:
+                return False
+    for event_col in ("labeled_event_type", "original_event_type"):
+        event_type = _safe_int(row.get(event_col))
+        if event_type in {int(EventType.FAVORABLE_FILL), int(EventType.TOXIC_FILL)}:
+            return True
+        if event_type is not None:
+            return False
+    return bool(fallback)
+
+
+def _post_trade_cols(window_ms: int) -> tuple[str, str]:
+    suffix = ms_to_suffix(int(window_ms))
+    return f"post_trade_best_bid_{suffix}", f"post_trade_best_ask_{suffix}"
 
 
 def _mid_price(bid, ask) -> float | None:

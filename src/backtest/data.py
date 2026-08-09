@@ -76,6 +76,17 @@ class BacktestFeatureBuilder:
         return int(self.lob_dim + self.tox_dim + 2)
 
     def build(self, row: pd.Series, end_idx: int | None = None) -> np.ndarray:
+        lob_seq, tox_seq, seq_len = self.materialize_sequences(row)
+        selected_end_idx = self._select_end_idx(seq_len) if end_idx is None else int(end_idx)
+        return self.build_from_sequences(
+            lob_seq=lob_seq,
+            tox_seq=tox_seq,
+            side=row.get("side"),
+            end_idx=selected_end_idx,
+            seq_len=seq_len,
+        )
+
+    def materialize_sequences(self, row: pd.Series) -> tuple[np.ndarray, np.ndarray, int]:
         lob_rep = row.get(self.lob_sequence_col)
         if lob_rep is None and self.fallback_lob_sequence_col:
             lob_rep = row.get(self.fallback_lob_sequence_col)
@@ -87,16 +98,24 @@ class BacktestFeatureBuilder:
         seq_len = self._clip_sequence_len(seq_len, row.get(self.sequence_length_col))
         if seq_len <= 0:
             raise ValueError(f"row {getattr(row, 'name', '<unknown>')} has no sequence data")
+        return lob_seq[:seq_len], tox_seq[:seq_len], int(seq_len)
 
-        lob_seq = lob_seq[:seq_len]
-        tox_seq = tox_seq[:seq_len]
-        selected_end_idx = self._select_end_idx(seq_len) if end_idx is None else int(end_idx)
-        selected_end_idx = int(np.clip(selected_end_idx, 0, seq_len - 1))
-
+    def build_from_sequences(
+        self,
+        *,
+        lob_seq: np.ndarray,
+        tox_seq: np.ndarray,
+        side,
+        end_idx: int,
+        seq_len: int | None = None,
+    ) -> np.ndarray:
+        if seq_len is None:
+            seq_len = min(np.asarray(lob_seq).shape[0], np.asarray(tox_seq).shape[0])
+        selected_end_idx = int(np.clip(int(end_idx), 0, int(seq_len) - 1))
         return build_dynamic_feature_window(
-            lob_seq=lob_seq,
-            tox_seq=tox_seq,
-            side=row.get("side"),
+            lob_seq=np.asarray(lob_seq)[: int(seq_len)],
+            tox_seq=np.asarray(tox_seq)[: int(seq_len)],
+            side=side,
             end_idx=selected_end_idx,
             lookback_steps=self.lookback_steps,
             lob_dim=self.lob_dim,
@@ -127,14 +146,7 @@ class BacktestFeatureBuilder:
         )
 
     def sequence_length(self, row: pd.Series) -> int:
-        lob_rep = row.get(self.lob_sequence_col)
-        if lob_rep is None and self.fallback_lob_sequence_col:
-            lob_rep = row.get(self.fallback_lob_sequence_col)
-        tox_rep = row.get(self.tox_sequence_col)
-        lob_seq = safe_stack_sequence(lob_rep, self.lob_dim)
-        tox_seq = safe_stack_sequence(tox_rep, self.tox_dim)
-        seq_len = min(lob_seq.shape[0], tox_seq.shape[0])
-        return self._clip_sequence_len(seq_len, row.get(self.sequence_length_col))
+        return self.materialize_sequences(row)[2]
 
     def initial_end_idx(self, seq_len: int) -> int:
         return int(min(self.lookback_steps - 1, max(seq_len - 1, 0)))
@@ -153,27 +165,38 @@ class BacktestDataset:
         sample_fraction: float = 1.0,
         sample_seed: int = CONFIG.random_seed,
         row_limit: int | None = None,
+        row_offset: int = 0,
     ) -> None:
         if not (0.0 < float(sample_fraction) <= 1.0):
             raise ValueError("sample_fraction must be in the interval (0, 1].")
         if row_limit is not None and int(row_limit) < 1:
             raise ValueError("row_limit must be >= 1 or None.")
+        if int(row_offset) < 0:
+            raise ValueError("row_offset must be >= 0.")
         self.path = Path(path)
         self.feature_builder = feature_builder
         self.columns = list(columns) if columns is not None else list(DEFAULT_REQUIRED_COLUMNS)
         self.sample_fraction = float(sample_fraction)
         self.sample_seed = int(sample_seed)
         self.row_limit = int(row_limit) if row_limit is not None else None
+        self.row_offset = int(row_offset)
         self.calibration_path = (
             Path(calibration_path)
             if calibration_path is not None
             else self._infer_train_calibration_path(self.path)
         )
+        self._frame_cache: pd.DataFrame | None = None
+        self._calibration_frame_cache: pd.DataFrame | None = None
+        self._sequence_cache: dict[tuple, tuple[np.ndarray, np.ndarray, int]] = {}
 
     def load_frame(self) -> pd.DataFrame:
+        if self._frame_cache is not None:
+            return self._frame_cache
         if not self.path.exists():
             raise FileNotFoundError(f"Backtest dataset not found: {self.path}")
         df = pd.read_parquet(self.path, columns=self._available_columns(self.path, self.columns))
+        if self.row_offset:
+            df = df.iloc[self.row_offset :]
         if self.row_limit is not None:
             df = df.head(self.row_limit)
         if self.sample_fraction < 1.0:
@@ -181,15 +204,19 @@ class BacktestDataset:
                 df.sample(frac=self.sample_fraction, random_state=self.sample_seed)
                 .sort_index()
             )
+        self._frame_cache = df
         return df
 
     def load_calibration_frame(self) -> pd.DataFrame | None:
+        if self._calibration_frame_cache is not None:
+            return self._calibration_frame_cache
         if self.calibration_path is None or not self.calibration_path.exists():
             return None
         columns = self._available_columns(self.calibration_path, WINDOW_SELECTION_COLUMNS)
         if not columns:
             return None
-        return pd.read_parquet(self.calibration_path, columns=columns)
+        self._calibration_frame_cache = pd.read_parquet(self.calibration_path, columns=columns)
+        return self._calibration_frame_cache
 
     def _available_columns(self, path: Path, columns: Iterable[str]) -> list[str]:
         try:
@@ -211,6 +238,45 @@ class BacktestDataset:
     def iter_snapshots(self) -> "BacktestSnapshotIterable":
         return BacktestSnapshotIterable(self)
 
+    def sequence_length_for_row(self, row_index: int, row: pd.Series) -> int:
+        return self._materialized_sequences(row_index, row)[2]
+
+    def build_features_for_row(
+        self,
+        row_index: int,
+        row: pd.Series,
+        *,
+        end_idx: int,
+    ) -> np.ndarray:
+        lob_seq, tox_seq, seq_len = self._materialized_sequences(row_index, row)
+        return self.feature_builder.build_from_sequences(
+            lob_seq=lob_seq,
+            tox_seq=tox_seq,
+            side=row.get("side"),
+            end_idx=end_idx,
+            seq_len=seq_len,
+        )
+
+    def _materialized_sequences(
+        self,
+        row_index: int,
+        row: pd.Series,
+    ) -> tuple[np.ndarray, np.ndarray, int]:
+        key = self._row_cache_key(row_index, row)
+        cached = self._sequence_cache.get(key)
+        if cached is not None:
+            return cached
+        materialized = self.feature_builder.materialize_sequences(row)
+        self._sequence_cache[key] = materialized
+        return materialized
+
+    def _row_cache_key(self, row_index: int, row: pd.Series) -> tuple:
+        return (
+            _cache_scalar(row.get("order_id")),
+            _cache_scalar(row.get("entry_time")),
+            int(row_index),
+        )
+
     @classmethod
     def from_runtime_artifacts(
         cls,
@@ -224,6 +290,7 @@ class BacktestDataset:
         sample_fraction: float = 1.0,
         sample_seed: int = CONFIG.random_seed,
         row_limit: int | None = None,
+        row_offset: int = 0,
     ) -> "BacktestDataset":
         with np.load(runtime_npz_path, allow_pickle=False) as data:
             feat_mean = data["feat_mean"]
@@ -242,6 +309,7 @@ class BacktestDataset:
             sample_fraction=sample_fraction,
             sample_seed=sample_seed,
             row_limit=row_limit,
+            row_offset=row_offset,
         )
 
 
@@ -256,12 +324,16 @@ class BacktestSnapshotIterable:
 
         df = self.dataset.load_frame()
         for row_index, row in df.iterrows():
-            seq_len = self.dataset.feature_builder.sequence_length(row)
+            seq_len = self.dataset.sequence_length_for_row(int(row_index), row)
             end_idx = self.dataset.feature_builder.initial_end_idx(seq_len)
             yield MarketSnapshot(
                 row_index=int(row_index),
                 row=row,
-                features=self.dataset.feature_builder.build(row, end_idx=end_idx),
+                features=self.dataset.build_features_for_row(
+                    int(row_index),
+                    row,
+                    end_idx=end_idx,
+                ),
                 update_idx=0,
                 end_idx=end_idx,
                 is_initial=True,
@@ -285,7 +357,7 @@ class BacktestSnapshotIterable:
         if max_evaluations is not None and int(max_evaluations) < 1:
             raise ValueError("max_evaluations must be >= 1 or None")
 
-        seq_len = self.dataset.feature_builder.sequence_length(snapshot.row)
+        seq_len = self.dataset.sequence_length_for_row(snapshot.row_index, snapshot.row)
         initial_end_idx = self.dataset.feature_builder.initial_end_idx(seq_len)
         candidates = np.arange(initial_end_idx + 1, seq_len, int(stride), dtype=np.int64)
         if max_evaluations is not None and candidates.size > int(max_evaluations):
@@ -305,7 +377,11 @@ class BacktestSnapshotIterable:
             yield MarketSnapshot(
                 row_index=snapshot.row_index,
                 row=snapshot.row,
-                features=self.dataset.feature_builder.build(snapshot.row, end_idx=end_idx),
+                features=self.dataset.build_features_for_row(
+                    snapshot.row_index,
+                    snapshot.row,
+                    end_idx=end_idx,
+                ),
                 update_idx=int(end_idx - initial_end_idx),
                 end_idx=int(end_idx),
                 is_initial=False,
@@ -430,3 +506,16 @@ def apply_dynamic_normalizer(
     pad_rows = x[..., mask_col_idx] < 0.5
     x_norm[pad_rows] = 0.0
     return x_norm
+
+
+def _cache_scalar(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, np.generic):
+        return value.item()
+    return value

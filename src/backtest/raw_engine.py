@@ -6,6 +6,7 @@ from collections import deque
 from collections.abc import Iterable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
+import copy
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -126,11 +127,31 @@ class RawDatabentoBacktestEngine:
         self._stats: dict[str, int] = {}
         self._rebuilt_snapshots: deque[_RebuiltFeatureSnapshot] = deque()
 
-    def run(self, orders: BacktestDataset | pd.DataFrame) -> BacktestReport:
+    def run(
+        self,
+        orders: BacktestDataset | pd.DataFrame,
+        *,
+        split_cache_path: str | Path | None = None,
+        empty_points: list[int] | None = None,
+        messages_between_splits: list[int] | None = None,
+        total_messages: int | None = None,
+        empty_scan_verbose: bool = True,
+    ) -> BacktestReport:
         orders_df, calibration_frame, feature_builder = self._load_orders(orders)
         if orders_df.empty:
             log(self.verbose, "No labeled orders supplied; returning an empty report.")
             return BacktestReport([])
+        if self._should_run_sequential_chunks(split_cache_path, empty_points):
+            return self._run_sequential_chunks(
+                orders_df,
+                calibration_frame,
+                feature_builder,
+                split_cache_path=split_cache_path,
+                empty_points=empty_points,
+                messages_between_splits=messages_between_splits,
+                total_messages=total_messages,
+                empty_scan_verbose=empty_scan_verbose,
+            )
 
         self._stats = self._empty_stats()
         log(
@@ -316,6 +337,107 @@ class RawDatabentoBacktestEngine:
         )
         return BacktestReport(results)
 
+    def _run_sequential_chunks(
+        self,
+        orders_df: pd.DataFrame,
+        calibration_frame: pd.DataFrame | None,
+        feature_builder: BacktestFeatureBuilder,
+        *,
+        split_cache_path: str | Path | None,
+        empty_points: list[int] | None,
+        messages_between_splits: list[int] | None,
+        total_messages: int | None,
+        empty_scan_verbose: bool,
+    ) -> BacktestReport:
+        if self.raw_path is None:
+            raise ValueError("Sequential chunked raw replay requires raw_path.")
+        scheduled = self._scheduled_orders(orders_df)
+        if not scheduled:
+            log(self.verbose, "No schedulable orders had usable entry_time/price.")
+            return BacktestReport([])
+
+        split_cache = self._resolve_split_cache(
+            split_cache_path=split_cache_path,
+            empty_points=empty_points,
+            messages_between_splits=messages_between_splits,
+            total_messages=total_messages,
+            empty_scan_verbose=empty_scan_verbose,
+        )
+        empty_points = split_cache["empty_points"]
+        messages_between_splits = split_cache["messages_between_splits"]
+        total_messages = split_cache["total_messages"]
+
+        chunks = build_raw_chunks(
+            empty_points=[int(item) for item in empty_points],
+            n_workers=max(1, len(empty_points) + 1),
+            messages_between_splits=messages_between_splits,
+            total_messages=total_messages,
+        )
+        chunks = filter_chunks_for_order_range(
+            chunks,
+            order_start_ns=int(scheduled[0][0]),
+            order_end_ns=int(scheduled[-1][0]) + 1,
+        )
+        if not chunks:
+            log(self.verbose, "No raw split chunks overlap the labeled order range.")
+            return BacktestReport([])
+
+        metrics = self._prepare_metrics(
+            calibration_frame if calibration_frame is not None else orders_df
+        )
+        results: list[BacktestResult] = []
+        log(
+            self.verbose,
+            "Starting sequential chunked raw replay "
+            f"with {len(chunks)} overlapping chunk(s); "
+            "non-overlapping split chunks will be skipped.",
+        )
+        for chunk in chunks:
+            chunk_orders = self._orders_for_chunk(orders_df, chunk)
+            if chunk_orders.empty:
+                continue
+            replay_end_ns = self._chunk_replay_end_ns(chunk, chunk_orders)
+            log(
+                self.verbose,
+                f"Sequential raw chunk {chunk.index}: "
+                f"{len(chunk_orders):,} order(s), "
+                f"start={_format_ns(chunk.start_ns) if chunk.start_ns is not None else 'file-start'}, "
+                f"end={_format_ns(replay_end_ns) if replay_end_ns is not None else 'file-end'}.",
+            )
+            engine = RawDatabentoBacktestEngine(
+                self.strategy,
+                raw_path=self.raw_path,
+                feature_builder=feature_builder,
+                metrics=metrics,
+                latency_provider=self.latency_provider,
+                snapshot_bin_messages=self.snapshot_bin_messages,
+                lifecycle_aware=self.lifecycle_aware,
+                lifecycle_stride=self.lifecycle_stride,
+                lifecycle_max_evaluations=self.lifecycle_max_evaluations,
+                censor_at_labeled_duration=self.censor_at_labeled_duration,
+                raw_order_max_lifetime_s=self.raw_order_max_lifetime_s,
+                strict_time_coverage=self.strict_time_coverage,
+                raw_replay_start_ns=chunk.start_ns,
+                raw_replay_end_ns=replay_end_ns,
+                verbose=self.verbose,
+                progress=self.progress,
+                progress_interval=self.progress_interval,
+            )
+            report = engine.run(chunk_orders)
+            chunk_results = list(report.results)
+            for result in chunk_results:
+                result.diagnostics["raw_chunk_index"] = int(chunk.index)
+                result.diagnostics["raw_chunk_start_ns"] = chunk.start_ns
+                result.diagnostics["raw_chunk_end_ns"] = chunk.end_ns
+            log(
+                self.verbose,
+                f"Sequential raw chunk {chunk.index} finished with "
+                f"{len(chunk_results):,} result(s).",
+            )
+            results.extend(chunk_results)
+        results.sort(key=lambda result: int(result.row_index))
+        return BacktestReport(results)
+
     def run_parallel(
         self,
         orders: BacktestDataset | pd.DataFrame,
@@ -345,19 +467,16 @@ class RawDatabentoBacktestEngine:
         order_start_ns = int(scheduled[0][0])
         order_end_ns = int(scheduled[-1][0]) + 1
 
-        if empty_points is None:
-            if split_cache_path is None:
-                split_cache_path = self.raw_path.with_suffix(
-                    self.raw_path.suffix + ".split_points.json"
-                )
-            split_cache = load_or_build_split_cache(
-                split_cache_path,
-                self.raw_path,
-                verbose=self.verbose or empty_scan_verbose,
-            )
-            empty_points = [int(item) for item in split_cache.get("split_points", [])]
-            messages_between_splits = split_cache.get("messages_between_splits")
-            total_messages = split_cache.get("total_messages")
+        split_cache = self._resolve_split_cache(
+            split_cache_path=split_cache_path,
+            empty_points=empty_points,
+            messages_between_splits=messages_between_splits,
+            total_messages=total_messages,
+            empty_scan_verbose=empty_scan_verbose,
+        )
+        empty_points = split_cache["empty_points"]
+        messages_between_splits = split_cache["messages_between_splits"]
+        total_messages = split_cache["total_messages"]
 
         resolved_workers = self._resolve_parallel_worker_count(n_workers, empty_points or [])
         log(
@@ -366,7 +485,14 @@ class RawDatabentoBacktestEngine:
             f"(requested={n_workers}, split_points={len(empty_points or [])}).",
         )
         if resolved_workers <= 1:
-            return self.run(orders)
+            return self.run(
+                orders,
+                split_cache_path=split_cache_path,
+                empty_points=empty_points,
+                messages_between_splits=messages_between_splits,
+                total_messages=total_messages,
+                empty_scan_verbose=empty_scan_verbose,
+            )
 
         chunks = build_raw_chunks(
             empty_points=[int(item) for item in (empty_points or [])],
@@ -390,6 +516,21 @@ class RawDatabentoBacktestEngine:
         prepared_metrics = self._prepare_metrics(
             calibration_frame if calibration_frame is not None else orders_df
         )
+        worker_strategy = self.strategy
+        if _strategy_uses_cuda_tensors(worker_strategy):
+            log(
+                self.verbose,
+                "Strategy model is on CUDA; moving a worker copy to CPU for "
+                "multiprocessing-safe raw replay.",
+            )
+            if not isinstance(self.latency_provider, StaticLatencyProvider):
+                log(
+                    self.verbose,
+                    "Measured latency in raw parallel mode will reflect CPU worker "
+                    "inference after CUDA tensors are moved off GPU. Use a static "
+                    "latency provider for GPU-latency experiments, or run single-process.",
+                )
+            worker_strategy = _cpu_strategy_copy(worker_strategy)
         worker_args = []
         for chunk in chunks:
             chunk_orders = self._orders_for_chunk(orders_df, chunk)
@@ -399,7 +540,7 @@ class RawDatabentoBacktestEngine:
             worker_args.append(
                 {
                     "chunk": chunk,
-                    "strategy": self.strategy,
+                    "strategy": worker_strategy,
                     "raw_path": str(self.raw_path),
                     "orders_df": chunk_orders,
                     "feature_builder": feature_builder,
@@ -450,6 +591,47 @@ class RawDatabentoBacktestEngine:
 
         results.sort(key=lambda result: int(result.row_index))
         return BacktestReport(results)
+
+    def _should_run_sequential_chunks(
+        self,
+        split_cache_path: str | Path | None,
+        empty_points: list[int] | None,
+    ) -> bool:
+        if self.raw_path is None or self.records is not None:
+            return False
+        if self.raw_replay_start_ns is not None or self.raw_replay_end_ns is not None:
+            return False
+        return split_cache_path is not None or empty_points is not None
+
+    def _resolve_split_cache(
+        self,
+        *,
+        split_cache_path: str | Path | None,
+        empty_points: list[int] | None,
+        messages_between_splits: list[int] | None,
+        total_messages: int | None,
+        empty_scan_verbose: bool,
+    ) -> dict[str, Any]:
+        if empty_points is None:
+            if self.raw_path is None:
+                raise ValueError("A raw_path is required to load or build split metadata.")
+            if split_cache_path is None:
+                split_cache_path = self.raw_path.with_suffix(
+                    self.raw_path.suffix + ".split_points.json"
+                )
+            split_cache = load_or_build_split_cache(
+                split_cache_path,
+                self.raw_path,
+                verbose=self.verbose or empty_scan_verbose,
+            )
+            empty_points = [int(item) for item in split_cache.get("split_points", [])]
+            messages_between_splits = split_cache.get("messages_between_splits")
+            total_messages = split_cache.get("total_messages")
+        return {
+            "empty_points": [int(item) for item in (empty_points or [])],
+            "messages_between_splits": messages_between_splits,
+            "total_messages": total_messages,
+        }
 
     def _empty_stats(self) -> dict[str, int]:
         return {
@@ -1341,6 +1523,27 @@ def _multiprocessing_context(start_method: str | None):
         except ValueError:
             return None
     return None
+
+
+def _strategy_uses_cuda_tensors(strategy: BaseStrategy) -> bool:
+    model = getattr(strategy, "model", None)
+    if model is None:
+        return False
+    try:
+        tensors = list(model.parameters()) + list(model.buffers())
+    except Exception:
+        return False
+    return any(bool(getattr(tensor, "is_cuda", False)) for tensor in tensors)
+
+
+def _cpu_strategy_copy(strategy: BaseStrategy) -> BaseStrategy:
+    strategy_copy = copy.deepcopy(strategy)
+    model = getattr(strategy_copy, "model", None)
+    if model is not None and hasattr(model, "to"):
+        model.to("cpu")
+    if hasattr(strategy_copy, "device"):
+        strategy_copy.device = "cpu"
+    return strategy_copy
 
 
 def _safe_int(value) -> int | None:
