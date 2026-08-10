@@ -1,4 +1,6 @@
 .env
+*.sh
+*.job
 __pycache__/
 .ipynb_checkpoints/
 .DS_store
@@ -9,4 +11,6 @@ logs/
 wandb/
 results/
 reports/
+generated_plots/
+checkpoints/
 *.output.*
