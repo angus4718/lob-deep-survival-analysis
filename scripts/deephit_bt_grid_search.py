@@ -66,8 +66,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--data-root",
         default=DATA_ROOT,
         help=(
-            "Root containing datasets/. On PSC this is usually "
-            "/ocean/projects/cis260122p/shared/data."
+            "Root containing datasets/."
         ),
     )
     parser.add_argument(
